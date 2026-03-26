@@ -1,0 +1,19 @@
+# Data
+ccxt
+python-binance
+polars
+pyarrow
+pyyaml
+
+# Utils
+loguru
+tqdm
+python-dotenv
+numpy
+ipykernel
+matplotlib
+scikit-learn
+statsmodels
+seaborn
+iisignature
+optuna

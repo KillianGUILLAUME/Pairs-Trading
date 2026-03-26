@@ -1,0 +1,28 @@
+{
+  "symbols": [
+    "FET/USDT",
+    "COS/USDT",
+    "LINK/USDT",
+    "TRX/USDT",
+    "BNB/USDT",
+    "PEPE/USDT",
+    "NEAR/USDT",
+    "PAXG/USDT",
+    "ZEC/USDT",
+    "XRP/USDT",
+    "UNI/USDT",
+    "ETH/USDT",
+    "EUR/USDT",
+    "ADA/USDT",
+    "SOL/USDT",
+    "DOGE/USDT",
+    "DEGO/USDT",
+    "USDC/USDT",
+    "SUI/USDT",
+    "BTC/USDT",
+    "LTC/USDT",
+    "ENJ/USDT",
+    "AVAX/USDT"
+  ],
+  "timeframe": "1h"
+}

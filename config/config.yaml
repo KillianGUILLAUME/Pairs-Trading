@@ -1,0 +1,23 @@
+data:
+  source: "binance"
+  universe:
+    quote_currency: "USDT"     # On trade contre USDT
+    min_volume_usdt: 10000000  # Volume minimum 24h (10M USDT)
+    top_n: 50                  # On garde les 50 plus liquides
+  
+  timeframes:
+    - "1h"
+    - "4h"  
+    - "1d"
+  
+  history:
+    start_date: "2022-01-01"
+    end_date: "2024-01-01"
+  
+  storage:
+    base_path: "data/storage/parquet"
+    format: "parquet"
+
+logging:
+  level: "INFO"
+  format: "{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}"
