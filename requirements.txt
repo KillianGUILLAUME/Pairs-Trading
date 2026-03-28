@@ -9,7 +9,7 @@ pyyaml
 loguru
 tqdm
 python-dotenv
-numpy
+numpy<2
 ipykernel
 matplotlib
 scikit-learn
@@ -17,3 +17,10 @@ statsmodels
 seaborn
 iisignature
 optuna
+torch==2.1.2
+signatory==1.2.6.1.9.0
+torchsde
+
+pandas
+wandb
+matplotlib

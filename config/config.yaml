@@ -21,3 +21,28 @@ data:
 logging:
   level: "INFO"
   format: "{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}"
+
+neural_net:
+  model:
+    data_dim: 2
+    time_dim: 64
+    sig_depth: 4
+    hidden_dim: 512
+    depth: 4
+  training:
+    epochs: 500 #1000
+    batch_size: 512
+    learning_rate: 0.0001
+    lambda_entropy: 0.1
+    min_variance: 0.1
+    seq_len: 128
+    interpolant: "linear"  # Options: "linear", "brownian_bridge"
+    sigma_dsbm: 0.5                 # Sigma utilisé pour le Brownian Bridge
+    theta_ou: 0.05
+    sigma_ou: 0.5
+  generation:
+    n_ode_steps: 35
+    n_mart_samples: 8
+    target_drift: 0.0
+    solver: "ode"                   # Options: "ode" (RK4) ou "sde" (Euler Maruyama)
+    sigma_sde: 0.5                  # Sigma pour réinjonction du bruit (fat tails)
