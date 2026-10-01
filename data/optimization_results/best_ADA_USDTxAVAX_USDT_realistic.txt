@@ -1,0 +1,10 @@
+# Optimal params — ADA_USDT × AVAX_USDT (realistic)
+# Score: 0.3437 | Sharpe: 1.303
+
+entry_threshold: 1.5
+exit_threshold: 0.9
+zscore_window: 204
+position_size: 0.22999999999999998
+stop_loss_z: 6.0
+max_holding_bars: 240
+cooldown_bars: 24

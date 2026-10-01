@@ -25,7 +25,6 @@ class SignalGeneratorConfig:
     compute_signature: bool = True 
 
 class KalmanPairFilter:
-
     def __init__(
         self,
         delta_beta:      float = 1e-8,
@@ -207,21 +206,21 @@ class SignatureFeatures:
 
         return np.array(results, dtype=np.float32)
 
+
 def calibrate_kalman(log_a: np.ndarray, log_b: np.ndarray, warmup: int = 500) -> dict:
     """
     Calibration automatique des hyperparamètres Kalman pour une paire.
-    Règle : R_opt = var(innovations_AR1) * 3.0
     """
     from sklearn.linear_model import LinearRegression
 
-    # OLS sur log-prix pour beta init
-    X = log_a[warmup:].reshape(-1, 1)
-    y = log_b[warmup:]
+    X = log_a[:warmup].reshape(-1, 1)
+    y = log_b[:warmup]
     lr = LinearRegression().fit(X, y)
+    
     beta_init     = float(lr.coef_[0])
     intercept_init = float(lr.intercept_)
 
-    # Résidus AR1 → variance innovations
+    # Résidus AR1 → variance innovations (toujours sur le warmup uniquement)
     residuals = y - lr.predict(X)
     delta_res = np.diff(residuals)
     var_innov = float(np.var(delta_res))
@@ -390,7 +389,6 @@ class SignalGenerator:
         is_volatile  = (roll_vol > vol_mult * median_vol).values
         
         # Z-score adaptatif : seuil plus élevé en régime volatile
-        # (optionnel, plus sophistiqué)
         
         return is_volatile, roll_vol.values, median_vol.values
 
@@ -416,10 +414,10 @@ class SignalGenerator:
         # Modèle : log_b = beta * log_a + intercept + spread
         if auto_calibrate:
             calib = calibrate_kalman(log_a, log_b, warmup=500)
-            logger.info(
-                f"Kalman calibré | R={calib['obs_noise']:.2e} | "
-                f"beta_init={calib['beta_init']:.4f}"
-            )
+            # logger.info(
+            #     f"Kalman calibré | R={calib['obs_noise']:.2e} | "
+            #     f"beta_init={calib['beta_init']:.4f}"
+            # )
             kf = KalmanPairFilter(
                 delta_beta      = calib["delta_beta"],
                 delta_intercept = calib["delta_intercept"],
@@ -439,23 +437,27 @@ class SignalGenerator:
         spreads_series = pd.Series(spreads)
 
         if self.use_ewm:
-            roll_mean = spreads_series.ewm(span=self.zscore_window, min_periods=50).mean()
-            roll_std  = spreads_series.ewm(span=self.zscore_window, min_periods=50).std()
+            roll_mean = spreads_series.ewm(span=self.zscore_window, min_periods=6).mean()
+            roll_std  = spreads_series.ewm(span=self.zscore_window, min_periods=6).std()
         else:
-            roll_mean = spreads_series.rolling(self.zscore_window, min_periods=50).mean()
-            roll_std  = spreads_series.rolling(self.zscore_window, min_periods=50).std()
+            roll_mean = spreads_series.rolling(self.zscore_window, min_periods=6).mean()
+            roll_std  = spreads_series.rolling(self.zscore_window, min_periods=6).std()
 
         zscores = ((spreads_series - roll_mean) / roll_std.replace(0, np.nan)).values
 
         # ✅ Pas de signal sur NaN
-        valid = ~np.isnan(zscores) & ~np.isnan(kalman_zscores)
+        valid = ~np.isnan(zscores) #& ~np.isnan(kalman_zscores)
+        # valid = ~np.isnan(kalman_zscores)
 
         entry_long  = np.zeros(n)
         entry_short = np.zeros(n)
         exit_signal = np.zeros(n)
 
-        kalman_confirms_long  = kalman_zscores < -2.0   # Kalman aussi voit spread négatif
-        kalman_confirms_short = kalman_zscores >  2.0   # Kalman aussi voit spread positif
+        prev_z = np.roll(zscores, 1)
+        prev_z[0] = 0.0
+
+        kalman_confirms_long  = kalman_zscores < -self.entry_threshold   # Kalman aussi voit spread négatif
+        kalman_confirms_short = kalman_zscores >  self.entry_threshold   # Kalman aussi voit spread positif
 
         max_zscore = 4.0
 
@@ -466,29 +468,33 @@ class SignalGenerator:
             entry_long  *= regime_mask.astype(float)
             entry_short *= regime_mask.astype(float)
 
-        is_volatile, roll_vol, median_vol = self._regime_filter(spreads, zscores)
+        # is_volatile, roll_vol, median_vol = self._regime_filter(spreads, zscores)
 
         # Masquer les signaux en régime volatile & Kalman
         entry_long[valid]  = (
             (zscores[valid] < -self.entry_threshold) &
             (zscores[valid] >= -max_zscore) &
-            kalman_confirms_long[valid] &
-            ~is_volatile[valid]
+            (prev_z[valid] >= -self.entry_threshold) &
+            (zscores[valid] >= -max_zscore)
+            # kalman_confirms_long[valid] #&
+            # ~is_volatile[valid]
         ).astype(float)
 
         entry_short[valid] = (
             (zscores[valid] >  self.entry_threshold) &
             (zscores[valid] <= max_zscore) &
-            kalman_confirms_short[valid] &
-            ~is_volatile[valid]
+            (prev_z[valid] <=  self.entry_threshold) &
+            (zscores[valid] <= max_zscore)
+            # kalman_confirms_short[valid] #&
+            # ~is_volatile[valid]
         ).astype(float)
 
         # Exit : l'un OU l'autre suffit (conservateur)
         exit_signal[valid] = (
             (np.abs(zscores[valid]) < self.exit_threshold) |
-            (np.abs(kalman_zscores[valid])  < self.exit_threshold) |
-            (np.abs(zscores[valid]) > max_zscore) |
-            (np.abs(kalman_zscores[valid]) > max_zscore)
+            # (np.abs(kalman_zscores[valid])  < self.exit_threshold) |
+            (np.abs(zscores[valid]) > max_zscore) #|
+            # (np.abs(kalman_zscores[valid]) > max_zscore)
         ).astype(float)
 
 

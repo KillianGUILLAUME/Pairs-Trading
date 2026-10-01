@@ -1,186 +1,146 @@
 import os
-import yaml
 import torch
 import numpy as np
 import pandas as pd
-import argparse
-from datetime import datetime
+from tqdm import tqdm
+from statsmodels.tsa.stattools import adfuller
 
-def load_real_data(pair_a="ZEC_USDT", pair_b="XRP_USDT", timeframe="1h", data_dir="data/storage/parquet"):
-    """
-    Charge les données historiques Parquet, les aligne sur le timestamp 
-    pour éviter tout décalage temporel, et retourne les prix de clôture.
-    """
-    path_a = os.path.join(data_dir, timeframe, f"{pair_a}.parquet")
-    path_b = os.path.join(data_dir, timeframe, f"{pair_b}.parquet")
-    
-    if not os.path.exists(path_a) or not os.path.exists(path_b):
-        raise FileNotFoundError(f"Données introuvables : {path_a} ou {path_b}. Lancez le pipeline de téléchargement.")
-        
-    print(f"Chargement des historiques {timeframe} pour {pair_a} et {pair_b}...")
-    
-    df_a = pd.read_parquet(path_a)
-    df_b = pd.read_parquet(path_b)
-    
-    df_a = df_a[['timestamp', 'close']].rename(columns={'close': 'close_a'})
-    df_b = df_b[['timestamp', 'close']].rename(columns={'close': 'close_b'})
-    
-    df_merged = pd.merge(df_a, df_b, on='timestamp', how='inner').sort_values('timestamp')
-    
-    price_a = df_merged['close_a'].to_numpy()
-    price_b = df_merged['close_b'].to_numpy()
-    
-    return price_a, price_b
+from neural_sde import GeneratorSDE # Ton fichier SDE
 
-# Importer les modules locaux
-from signature_vf import CausalVelocityField
-
-def load_config(config_path="config/config.yaml"):
-    with open(config_path, "r") as f:
-        return yaml.safe_load(f)
-
-def reconstruct_prices(log_returns: np.ndarray, init_prices: tuple) -> np.ndarray:
-    """
-    Reconstruit les prix bruts à partir des séquences de log-returns.
-    Args:
-        log_returns: (N_steps, 2)
-        init_prices: (P0_A, P0_B)
-    Returns:
-        prices: (N_steps+1, 2)
-    """
-    prices = np.zeros((log_returns.shape[0] + 1, 2))
-    prices[0] = init_prices
-    
-    # cumsum des log-returns = log(P_t) - log(P_0) -> P_t = P_0 * exp(cumsum)
-    cumulative_returns = np.cumsum(log_returns, axis=0)
-    prices[1:] = init_prices * np.exp(cumulative_returns)
-    return prices
-
-def generate_synthetic_paths(
-    model_path: str,
-    n_trajectories: int = 1000,
-    n_steps: int = 24 * 30, # 1 mois de données horaire (720h)
-    batch_size: int = 250,
-):
-    """
-    Génère N trajectoires synthétiques via le modèle génératif causal.
-    """
-    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    
-    # 1. Charger le modèle et ses métadonnées
-    device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
-    print(f"Chargement du modèle depuis {model_path} sur {device}...")
-    
-    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
-    nn_config = checkpoint["config"]
+def load_trained_model(model_path: str, device: str):
+    """Charge le modèle, la config et le scaler."""
+    checkpoint = torch.load(model_path, map_location=device)
+    config = checkpoint["config"]
     scaler = checkpoint["scaler"]
     
-    mean = torch.tensor(scaler["mean"], device=device, dtype=torch.float32)
-    std = torch.tensor(scaler["std"], device=device, dtype=torch.float32)
+    model_cfg = config["model"]
     
-    # 2. Instancier le modèle
-    model_cfg = nn_config["model"]
-    model = CausalVelocityField(
+    # On instancie le modèle avec les paramètres de la config
+    model = GeneratorSDE(
         data_dim=model_cfg.get("data_dim", 2),
-        time_dim=model_cfg.get("time_dim", 64),
-        sig_depth=model_cfg.get("sig_depth", 3),
-        hidden_dim=model_cfg.get("hidden_dim", 256)
+        hidden_dim=model_cfg.get("hidden_dim", 32),
+        target_vol=1.0, # A ajuster si tu l'as sauvegardé dans le checkpoint
+        min_vol=0.1
     ).to(device)
     
     model.load_state_dict(checkpoint["model_state_dict"])
-    model.eval()
-    print("Modèle prêt.")
+    model.eval() # Mode Inférence, très important
+    
+    return model, scaler
 
-    # 3. Préparer une fenêtre initiale (past_window)
-    # En pratique, on pioche ça dans les VRAIES données historiques 
-    # pour générer N trajectoires à partir du contexte le plus récent.
-    data_dir = os.path.join(project_root, "data", "storage", "parquet")
-    price_a, price_b = load_real_data(data_dir=data_dir)
+def filter_cointegrated_paths(paths_np: np.ndarray, max_pvalue: float = 0.05) -> list:
+    """
+    Test de Dickey-Fuller Augmenté (ADF) sur le spread de chaque chemin.
+    paths_np : Array numpy de taille [n_paths, seq_len, 2]
+    """
+    accepted_indices = []
     
-    log_ret_a = np.diff(np.log(price_a))
-    log_ret_b = np.diff(np.log(price_b))
-    raw_returns = np.stack([log_ret_a, log_ret_b], axis=1)
-    
-    # Standardisation manuelle
-    scaled_returns = (raw_returns - scaler["mean"]) / (scaler["std"] + 1e-8)
-    scaled_returns = torch.tensor(scaled_returns, dtype=torch.float32, device=device)
-    
-    window_size = nn_config.get("training", {}).get("window_size", 60)
-    
-    # On prend la dernière fenêtre de N jours réels comme point de départ
-    actual_history = scaled_returns[-window_size:].unsqueeze(0)
-    
-    # On duplique ce contexte pour chaque trajectoire du batch
-    dummy_history = actual_history.expand(batch_size, -1, -1)
-    
-    gen_config = nn_config.get("generation", {})
-    n_ode_steps = gen_config.get("n_ode_steps", 20)
-    n_mart_samples = gen_config.get("n_mart_samples", 8)
-    solver = gen_config.get("solver", "ode")
-    sigma_sde = gen_config.get("sigma_sde", 0.5)
-    
-    # 4. Générer par batchs
-    all_generated_paths = []
-    
-    print(f"Génération de {n_trajectories} trajectoires de {n_steps} pas de temps...")
-    print(f"Paramètres : Solver={solver.upper()}, Martingale=True, N_ODE={n_ode_steps}")
-    # On itère par batchs pour gérer la RAM GPU
-    for i in range(0, n_trajectories, batch_size):
-        actual_batch_size = min(batch_size, n_trajectories - i)
+    # On itère sur chaque chemin généré
+    for i in range(paths_np.shape[0]):
+        path = paths_np[i]
         
-        # Extrait le bon nombre de séquences historiques
-        batch_history = dummy_history[:actual_batch_size]
+        # On recrée le proxy du spread (log_a - log_b)
+        # (Attention : path contient déjà les log-prix dénormalisés)
+        spread = path[:, 0] - path[:, 1]
         
-        # Generation autoregressive + PCFM Martingale
-        with torch.no_grad():
-            gen_scaled = model.generate_trajectory(
-                initial_window=batch_history,
-                n_future_steps=n_steps,
-                n_ode_steps=n_ode_steps,
-                martingale=True,  # Projette sur la martingale (PCFM)
-                n_mart_samples=n_mart_samples, 
-                target_drift=0.0, # Assumes pure martingale for synthetic stress tests
-                solver=solver,
-                sigma_sde=sigma_sde
-            )
+        try:
+            # Test ADF pour vérifier si le spread est stationnaire (Mean-Reverting)
+            adf_result = adfuller(spread, maxlag=1) 
+            p_value = adf_result[1]
             
-        # Inverse-transform (déstandardisation vers la vraie volatilité)
-        # gen_scaled: (batch, n_steps, 2)
-        gen_returns = (gen_scaled * std) + mean
-        all_generated_paths.append(gen_returns.cpu().numpy())
-        
-        print(f"[{i + actual_batch_size}/{n_trajectories}] Trajectoires générées.")
+            # Si p-value < 0.05, on rejette l'hypothèse de non-stationnarité
+            if p_value < max_pvalue:
+                accepted_indices.append(i)
+        except Exception:
+            # Sécurité si le test ADF échoue (ex: NaN à cause du SDE)
+            pass
+            
+    return accepted_indices
 
-    # Concaténer tout
-    final_returns = np.concatenate(all_generated_paths, axis=0) # (1000, 720, 2)
+def main(price_a, price_b, seq_len=2000, n_paths_to_generate=5000, batch_size=500):
+    device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+    print(f"Génération sur : {device.upper()}")
     
-    # 5. Sauvegarde
-    out_dir = os.path.join(project_root, "data", "storage", "synthetic")
-    os.makedirs(out_dir, exist_ok=True)
+    # --- 1. Paramètres de Génération ---
+    model_path = "data/models/best_val_sde.pt" #to adapt
+    output_dir = "data/synthetic_paths"
     
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_file = os.path.join(out_dir, f"synthetic_scenarios_{timestamp}.npy")
+    os.makedirs(output_dir, exist_ok=True)
     
-    # Pour un P&L Vectorisé, on sauvegarde souvent le tenseur Numpy (Rapide + 3D)
-    # ou on flatten() en Parquet (Trajectoire_ID, Step, P_A, P_B).
-    # Ici on sauvegarde en .npy direct pour l'accès Monte Carlo.
-    np.save(out_file, final_returns)
-    print(f"Données enregistrées dans : {out_file}")
+    # --- 2. Chargement ---
+    model, scaler = load_trained_model(model_path, device)
+    std = scaler["std"]
+    mean = scaler["mean"]
+    
+    # --- 3. Point de départ (y0) ---
+    log_a_init = np.log(price_a[-1]) 
+    log_b_init = np.log(price_b[-1]) 
+    
+    # On doit le standardiser comme pendant l'entraînement !
+    scaled_a_init = (log_a_init - mean[0]) / std[0]
+    scaled_b_init = (log_b_init - mean[1]) / std[1]
+    
+    # Tenseur de départ [1, 2]
+    y0 = torch.tensor([[scaled_a_init, scaled_b_init]], dtype=torch.float32, device=device)
+    
+    print(f"Génération de {n_paths_to_generate} chemins de {seq_len} barres...")
+    
+    all_accepted_paths = []
+    
+    # --- 4. Boucle de Batching (GPU) ---
+    for batch_start in tqdm(range(0, n_paths_to_generate, batch_size)):
+        current_batch_size = min(batch_size, n_paths_to_generate - batch_start)
+        
+        with torch.no_grad():
+            # Génération SDE
+            # Output: [1, batch_size, seq_len, 2] -> On vire la 1ère dim avec [0]
+            generated_scaled = model.generate_synthetic_paths(
+                y0=y0, 
+                seq_len=seq_len, 
+                n_paths=current_batch_size
+            )[0].cpu().numpy() # [batch_size, seq_len, 2]
+            
+        # --- 5. Dénormalisation & Reverse Log ---
+        # 1. On remet la moyenne et l'écart-type
+        generated_log = (generated_scaled * std) + mean
+        
+        # 2. On passe à l'exponentielle pour avoir les VRAIS prix en $ !
+        generated_prices = np.exp(generated_log)
+        
+        # --- 6. Filtrage Quant (Test ADF) ---
+        # On fait le test sur les log-prix (generated_log) car le spread financier
+        # se calcule toujours sur les logs pour la cointégration.
+        accepted_idx = filter_cointegrated_paths(generated_log, max_pvalue=0.05)
+        
+        # On stocke les VRAIS prix des chemins acceptés
+        if accepted_idx:
+            all_accepted_paths.append(generated_prices[accepted_idx])
+            
+    # --- 7. Sauvegarde ---
+    if not all_accepted_paths:
+        print(f"❌ Aucun chemin n'a passé le test ADF. Le SDE diverge trop sur {seq_len} barres.")
+        return
+        
+    final_paths = np.concatenate(all_accepted_paths, axis=0)
+    acceptance_rate = (len(final_paths) / n_paths_to_generate) * 100
+    print(f"✅ Génération terminée ! {len(final_paths)} chemins gardés (Taux d'acceptation : {acceptance_rate:.1f}%)")
+    
+    # On sauvegarde chaque chemin dans un gros fichier Parquet (format long)
+    print("Sauvegarde en cours...")
+    records = []
+    for path_id in range(len(final_paths)):
+        for t in range(seq_len):
+            records.append({
+                "path_id": path_id,
+                "step": t,
+                "price_a": final_paths[path_id, t, 0],
+                "price_b": final_paths[path_id, t, 1]
+            })
+            
+    df_synthetic = pd.DataFrame(records)
+    save_path = os.path.join(output_dir, f"synthetic_dataset_{seq_len}bars.parquet")
+    df_synthetic.to_parquet(save_path, engine="pyarrow")
+    print(f"💾 Dataset sauvegardé : {save_path}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Générer des scénarios de test (PCFM).")
-    parser.add_argument("--model", type=str, required=True, help="Chemin vers le fichier .pt")
-    parser.add_argument("--n_traj", type=int, default=1000, help="Nombre de trajectoires à générer")
-    parser.add_argument("--n_steps", type=int, default=720, help="Nombre de pas (heures) par trajectoire")
-    args = parser.parse_args()
-    
-    # Vérification fichier modèle
-    if not os.path.exists(args.model):
-        print(f"Erreur : le modèle {args.model} n'existe pas.")
-        exit(1)
-        
-    generate_synthetic_paths(
-        model_path=args.model,
-        n_trajectories=args.n_traj,
-        n_steps=args.n_steps,
-    )
+    main()

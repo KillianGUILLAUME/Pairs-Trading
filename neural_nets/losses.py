@@ -1,6 +1,6 @@
 import torch
 import torch.nn.functional as F
-# import signatory
+import signatory
 import wandb
 
 # ============================================
@@ -349,115 +349,205 @@ def train_teacher(
 # Neural SDE : Signature MMD Loss
 # ============================================
 
-class SignatureMMDLoss:
+class SignatureMMDLoss(torch.nn.Module):
     """
     Maximum Mean Discrepancy (MMD) sur les Path Signatures.
     
     Calcule la distance L2 entre l'Espérance de la signature (Moment Matching).
     Comprend désormais la projection Unitaire Relative (Relative Error) pour stabiliser les gradients.
+    Utilise `signatory.Signature` (Module) plutôt que la fonction stateless :
+    depth et options sont stockés une seule fois, le module est éligible à .to(device).
     """
     def __init__(self, depth: int = 4):
+        super().__init__()
         self.depth = depth
+        # Module persistant : instancié une fois, réutilisé à chaque forward
+        self.sig_fn = signatory.Signature(depth=depth)
 
-    def __call__(self, real_paths: torch.Tensor, generated_paths: torch.Tensor) -> torch.Tensor:
-
-        sig_real = signatory.signature(real_paths, self.depth)
-        sig_gen = signatory.signature(generated_paths, self.depth)
+    def forward(self, real_paths: torch.Tensor, generated_paths: torch.Tensor) -> torch.Tensor:
+        sig_real = self.sig_fn(real_paths)
+        sig_gen  = self.sig_fn(generated_paths)
         
         mean_sig_real = sig_real.mean(dim=0)
-        mean_sig_gen = sig_gen.mean(dim=0)
+        mean_sig_gen  = sig_gen.mean(dim=0)
         
-        raw_dist = torch.norm(mean_sig_real - mean_sig_gen, p=2)
+        raw_dist  = torch.norm(mean_sig_real - mean_sig_gen, p=2)
         real_norm = torch.norm(mean_sig_real, p=2).detach().clamp(min=1e-6)
         
         return raw_dist / real_norm
 
+    # Alias pour compatibilité avec l'ancien code non-Module
+    def __call__(self, real_paths, generated_paths):
+        return self.forward(real_paths, generated_paths)
 
-class KernelSignatureMMDLoss:
+
+class KernelSignatureMMDLoss(torch.nn.Module):
     """
-    Maximum Mean Discrepancy (MMD) sur les Path Signatures avec un noyau Gaussien (RBF).
+    Multi-scale Kernel MMD sur Path Signatures (RBF kernel).
+    Compare des distributions de chemins via leurs signatures tronquées.
     
-    Contrairement à la distance L2 sur les moyennes, le Kernel MMD compare toutes 
-    les paires possibles (réel-réel, gen-gen, et croisées réel-gen) via une 
-    matrice de Gram. Cela force la SDE à répliquer l'intégralité de la distribution 
-    (Moment Matching implicite d'ordre infini sur l'espace des signatures).
+    Optimisations :
+    - signatory.Signature instancié une fois (nn.Module persistent)
+    - sigmas, sig_mean, sig_std enregistrés comme buffers (suivent .to(device))
+    - Kernel multi-échelle vectorisé (broadcast sur S échelles simultanément)
     """
-    def __init__(self, depth: int = 4, sigma: float = 1.0):
+
+    def __init__(
+        self,
+        depth: int = 4,
+        sigmas: list = None,
+        sig_scaler_mean: torch.Tensor = None,
+        sig_scaler_std: torch.Tensor = None,
+    ):
+        super().__init__()
         self.depth = depth
-        self.sigma = sigma
-        
-    def rbf_kernel(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        """
-        Calcule k(x, y) = exp( - ||x - y||^2 / (2 * sigma^2) ) de manière vectorisée.
-        Optimisation Extrême : Puisque `x` et `y` sont projetés sur l'hypersphère (Norme=1),
-        on sait mathématiquement que ||x - y||^2 = ||x||^2 + ||y||^2 - 2<x,y> = 2 - 2<x,y>.
-        Cela évite de recalculer les normes et divise le coût de calcul matriciel par 2 !
-        """
-        # Produit scalaire <x, y>
-        xy_inner = torch.mm(x, y.transpose(0, 1))
-        
-        # Distance au carré sur la sphère unitaire
-        dist_sq = 2.0 - 2.0 * xy_inner
-        
-        # Clamp symbolique pour les flottants
-        dist_sq = torch.clamp(dist_sq, min=0.0)
-        
-        return torch.exp(-dist_sq / (2.0 * self.sigma ** 2))
 
-    def __call__(self, real_paths: torch.Tensor, generated_paths: torch.Tensor) -> torch.Tensor:
-        
+        # Module persistent : suit .to(device) automatiquement
+        self.sig_fn = signatory.Signature(depth=depth)
 
-        sig_real = signatory.signature(real_paths, self.depth)
-        sig_gen = signatory.signature(generated_paths, self.depth)
-        
-        # Le Clamp interne : modifie 0.0 en 1e-8, mais laisse 1.5 intact (sans faire 1.50000001)
-        norm_real = torch.sqrt(torch.clamp(torch.sum(sig_real ** 2, dim=1, keepdim=True), min=1e-8))
-        sig_real_norm = sig_real / norm_real
-        
-        norm_gen = torch.sqrt(torch.clamp(torch.sum(sig_gen ** 2, dim=1, keepdim=True), min=1e-8))
-        sig_gen_norm = sig_gen / norm_gen
-        
-        k_xx = self.rbf_kernel(sig_real_norm, sig_real_norm)
-        k_yy = self.rbf_kernel(sig_gen_norm, sig_gen_norm)
-        k_xy = self.rbf_kernel(sig_real_norm, sig_gen_norm)
-        
-        mmd_sq = k_xx.mean() + k_yy.mean() - 2.0 * k_xy.mean()
-        
-        # Même chose à la fin
-        return torch.sqrt(torch.clamp(mmd_sq, min=1e-8))
+        # --- Buffers : vivent sur le bon device, inclus dans state_dict ---
+        _sigmas = torch.tensor(
+            sigmas if sigmas is not None else [0.1, 0.5, 1.0, 5.0, 10.0],
+            dtype=torch.float32,
+        )
+        self.register_buffer("sigmas", _sigmas)
 
+        # Scalers : toujours enregistrés comme buffers (même si None → placeholder)
+        # On utilise un flag pour savoir si on doit normaliser
+        self._use_scaler = sig_scaler_mean is not None and sig_scaler_std is not None
+
+        if self._use_scaler:
+            self.register_buffer("sig_mean", sig_scaler_mean.float())
+            self.register_buffer("sig_std",  sig_scaler_std.float().clamp(min=1e-8))
+        else:
+            # Placeholders (permet un state_dict cohérent si tu save/load)
+            self.register_buffer("sig_mean", torch.zeros(1))
+            self.register_buffer("sig_std",  torch.ones(1))
+
+    def _normalize(self, sig_raw: torch.Tensor) -> torch.Tensor:
+        if self._use_scaler:
+            return (sig_raw - self.sig_mean) / self.sig_std
+        return sig_raw
+
+    def forward(
+        self,
+        real_paths: torch.Tensor,
+        generated_paths: torch.Tensor,
+        precomputed_sig_real: torch.Tensor = None,
+    ) -> torch.Tensor:
+
+        # --- Signatures (avec cache possible sur le réel, qui ne change pas) ---
+        if precomputed_sig_real is not None:
+            sig_real = precomputed_sig_real
+        else:
+            sig_real = self._normalize(self.sig_fn(real_paths))
+
+        sig_gen = self._normalize(self.sig_fn(generated_paths))
+
+        # --- Distances L2² vectorisées (B x B) ---
+        # Note : cdist(..., p=2).pow(2) fait une sqrt puis un carré → gaspillage.
+        # On calcule directement ||x-y||² = ||x||² + ||y||² - 2 x·yᵀ
+        dist_xx = self._pairwise_sq_dist(sig_real, sig_real)
+        dist_yy = self._pairwise_sq_dist(sig_gen,  sig_gen)
+        dist_xy = self._pairwise_sq_dist(sig_real, sig_gen)
+
+        # --- Multi-scale RBF kernel (broadcast sur S échelles) ---
+        gammas = (1.0 / (2.0 * self.sigmas.pow(2))).view(-1, 1, 1)  # (S,1,1)
+
+        k_xx = 1.0 / (1.0 + gammas * dist_xx)
+        k_yy = 1.0 / (1.0 + gammas * dist_yy)
+        k_xy = 1.0 / (1.0 + gammas * dist_xy)
+
+        mmd_per_scale = (
+            k_xx.mean(dim=(1, 2))
+            + k_yy.mean(dim=(1, 2))
+            - 2.0 * k_xy.mean(dim=(1, 2))
+        )
+        mmd_sq = mmd_per_scale.sum()
+
+        return torch.clamp(mmd_sq, min=0.0)
+
+    @staticmethod
+    def _pairwise_sq_dist(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """||x_i - y_j||² vectorisé, sans passer par sqrt."""
+        x = x.to(torch.float32)
+        y = y.to(torch.float32)
+        x_sq = (x * x).sum(dim=1, keepdim=True)           # (Bx, 1)
+        y_sq = (y * y).sum(dim=1, keepdim=True).T         # (1, By)
+        xy   = x @ y.T                                    # (Bx, By)
+        return (x_sq + y_sq - 2.0 * xy).clamp(min=0.0)
 
 # ============================================
 # Fonction d'entraînement (SDE)
 # ============================================
 
+def _compute_extra_metrics(real_paths: torch.Tensor, generated_paths: torch.Tensor) -> dict:
+    """Métriques diagnostiques pour wandb."""
+    with torch.no_grad():
+        real_spread = real_paths[:, :, 0] - real_paths[:, :, 1]
+        gen_spread  = generated_paths[:, :, 0] - generated_paths[:, :, 1]
+
+        real_vol   = real_spread.std(dim=1).mean().item()
+        gen_vol    = gen_spread.std(dim=1).mean().item()
+        real_drift = real_spread.diff(dim=1).mean().item()
+        gen_drift  = gen_spread.diff(dim=1).mean().item()
+        gen_norm   = generated_paths.norm(dim=-1).mean().item()
+
+    return {
+        "diagnostics/real_spread_vol": real_vol,
+        "diagnostics/gen_spread_vol":  gen_vol,
+        "diagnostics/vol_ratio":       gen_vol / (real_vol + 1e-8),
+        "diagnostics/real_drift":      real_drift,
+        "diagnostics/gen_drift":       gen_drift,
+        "diagnostics/gen_path_norm":   gen_norm,
+    }
+
+
+
+
 def train_sde(
     generator_sde,
     train_loader,
     val_loader,
+    sig_mean: torch.Tensor, 
+    sig_std: torch.Tensor,
     num_epochs: int = 1000,
     lr: float = 1e-3,
+    weight_decay: float = 0.01,
     device: str = 'cuda',
     sig_depth: int = 4,
     use_wandb: bool = False
 ):
     """
-    Boucle d'entraînement SDE avec Signature MMD, Validation, Plots et Early Stopping.
+    Boucle d'entraînement SDE avec Kernel Signature MMD, Validation, Plots et Early Stopping.
     """
     import os
     import matplotlib.pyplot as plt
     
     generator_sde.to(device)
     
-    loss_fn = KernelSignatureMMDLoss(depth=sig_depth, sigma=1.0)
-    optimizer = torch.optim.AdamW(generator_sde.parameters(), lr=lr, weight_decay=1e-4)
+    loss_fn = KernelSignatureMMDLoss(
+        depth=sig_depth,
+        sigmas=[1.0, 5.0, 10.0, 20.0, 40.0],
+        sig_scaler_mean=sig_mean,
+        sig_scaler_std=sig_std,
+    ).to(device)
+        
+    optimizer = torch.optim.AdamW(generator_sde.parameters(), lr=lr, weight_decay=weight_decay, fused=True)
 
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    from torch.optim.swa_utils import AveragedModel
+
+    ema_sde = AveragedModel(
+        generator_sde,
+        avg_fn=lambda avg, p, n: 0.999 * avg + 0.001 * p,
+    )
+
+    accum_iter = 4
+    steps_per_epoch = (len(train_loader) + accum_iter - 1) // accum_iter
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, 
-        mode='min',      
-        factor=0.5,     
-        patience=20,     
-        verbose=True     
+        T_max=num_epochs,
+        eta_min=1e-7
     )
 
     # Paramètres d'Early Stopping
@@ -465,86 +555,107 @@ def train_sde(
     early_stop_patience = 70
     epochs_no_improve = 0
 
+    ts_cache = None
+
     for epoch in range(num_epochs):
         generator_sde.train()
-        epoch_loss = 0.0
-        num_batches = 0
+        epoch_loss, num_batches = 0.0, 0
+        optimizer.zero_grad(set_to_none=True)
 
-        for batch in train_loader:
+
+        last_grad_norm = 0.0
+
+        for batch_idx, batch in enumerate(train_loader):
             if isinstance(batch, (list, tuple)):
                 # non_blocking=True est crucial avec pin_memory=True :
                 # ça permet au GPU de charger le prochain batch PENDANT qu'il calcule le précédent !
-                x_1 = batch[0].to(device, non_blocking=True)
+                real_paths = batch[0].to(device, non_blocking=True) # Shape (B, L, 2)
+                conditions = batch[1].to(device, non_blocking=True)
+                preputed = batch[2].to(device, non_blocking=True) if len(batch) > 2 else None
             else:
-                x_1 = batch.to(device, non_blocking=True)
+                 real_paths = batch.to(device, non_blocking=True)
+                 conditions = None
+                 preputed = None
+            
+            B, seq_len, _ = real_paths.shape
+            if ts_cache is None or ts_cache.shape[0] != seq_len:
+                ts_cache = torch.linspace(0., float(seq_len - 1), seq_len, device=device)
 
-            optimizer.zero_grad()
-            
-            # x_1 contient les log-returns (incréments).
-            # La SDE intègre des chemins, on transforme les cibles en chemins cumulés :
-            # shape (B, L, Dim)
-            real_paths = torch.cumsum(x_1, dim=1)
-            
-            # Pour que le temps 0 soit exactement à 0.0
-            zeros = torch.zeros(real_paths.size(0), 1, real_paths.size(2), device=device)
-            real_paths = torch.cat([zeros, real_paths], dim=1) # (B, L+1, Dim)
-            
-            batch_size, seq_len_plus_1, data_dim = real_paths.shape
-
-            # Génération par la SDE
-            ts = torch.linspace(0.0, float(seq_len_plus_1 - 1), seq_len_plus_1, device=device)
-            y0 = torch.zeros(batch_size, data_dim, device=device)
+            y0 = real_paths[:, 0, :]
 
             # Résolution Differentiable de la SDE
-            generated_paths = generator_sde(y0, ts)
+            generated_paths = generator_sde(y0, ts_cache, conditions)
+            generated_paths = torch.clamp(generated_paths, min=-30.0, max=30.0)
             
-            # Signature MMD
-            loss = loss_fn(real_paths, generated_paths)
+            # Signature MMD bypass avec Accumulation
+            loss = loss_fn(real_paths, generated_paths, preputed)
+            scaled_loss = loss / accum_iter
+                
+            scaled_loss.backward()
+
             
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(generator_sde.parameters(), max_norm=1.0)
-            optimizer.step()
+            # Application du gradient tous les 'accum_iter' pas ou à la toute fin
+            if ((batch_idx + 1) % accum_iter == 0) or (batch_idx + 1 == len(train_loader)):
+                torch.nn.utils.clip_grad_norm_(generator_sde.parameters(), max_norm=1.0)
+                total_norm = 0.0
+                for p in generator_sde.parameters():
+                    if p.grad is not None:
+                        total_norm += p.grad.data.norm(2).item() ** 2
+                last_grad_norm = total_norm ** 0.5
+
+                optimizer.step()
+                scheduler.step()
+                ema_sde.update_parameters(generator_sde)
+                optimizer.zero_grad(set_to_none=True)
+
 
             epoch_loss += loss.item()
             num_batches += 1
 
-        avg_train_loss = epoch_loss / num_batches
+        avg_train_loss = epoch_loss / max(num_batches, 1)
 
         # ==========================================
         # VALIDATION & EARLY STOPPING (Tous les 10 Epochs)
         # ==========================================
-        if epoch % 10 == 0:
-            generator_sde.eval()
+        if epoch % 1 == 0: #to have better metrics (time compute)
+            ema_sde.module.eval()
             val_loss = 0.0
             val_batches = 0
+            ts_val_cache = None
             
             with torch.no_grad():
                 for batch in val_loader:
-                    x_1_val = batch[0].to(device) if isinstance(batch, (list, tuple)) else batch.to(device)
-                    
-                    real_paths_val = torch.cumsum(x_1_val, dim=1)
-                    zeros_val = torch.zeros(real_paths_val.size(0), 1, real_paths_val.size(2), device=device)
-                    real_paths_val = torch.cat([zeros_val, real_paths_val], dim=1)
-                    
+                    if isinstance(batch, (list, tuple)):
+                        real_paths_val = batch[0].to(device, non_blocking=True)
+                        conditions_val = batch[1].to(device, non_blocking=True)
+                        preputed_val = batch[2].to(device, non_blocking=True) if len(batch) > 2 else None
+                    else:
+                        real_paths_val = batch.to(device, non_blocking=True)
+                        conditions_val = None
+                        preputed_val = None
                     b_size, seq_len_val, d_dim = real_paths_val.shape
+
+                    if ts_val_cache is None or ts_val_cache.shape[0] != seq_len_val:
+                        ts_val_cache = torch.linspace(0.0, float(seq_len_val - 1), seq_len_val, device=device)
                     
-                    ts_val = torch.linspace(0.0, float(seq_len_val - 1), seq_len_val, device=device)
-                    y0_val = torch.zeros(b_size, d_dim, device=device)
+                    y0_val = real_paths_val[:, 0, :]
                     
-                    generated_paths_val = generator_sde(y0_val, ts_val)
-                    v_loss = loss_fn(real_paths_val, generated_paths_val)
+                    generated_paths_val = ema_sde.module(y0_val, ts_val_cache, conditions_val)
+                    v_loss = loss_fn(real_paths_val, generated_paths_val, preputed_val)
                     
                     val_loss += v_loss.item()
                     val_batches += 1
             
-            avg_val_loss = val_loss / val_batches
-            scheduler.step(avg_val_loss)
+            avg_val_loss = val_loss / max(val_batches, 1)
+
+            extra_metrics = _compute_extra_metrics(real_paths_val, generated_paths_val)
             
             print(f"Epoch {epoch:04d}/{num_epochs} | Train MMD: {avg_train_loss:.4f} | Val MMD: {avg_val_loss:.4f}")
 
-            # Plotting toutes les 20 epochs
+
+            # Plotting toutes les 5 epochs
             fig_img = None
-            if epoch % 20 == 0 and use_wandb:
+            if epoch % 5 == 0 and use_wandb:
                 fig, axes = plt.subplots(1, 2, figsize=(12, 5))
                 # On prend un sample du dernier batch de validation
                 real_sample = real_paths_val[0].cpu().numpy()
@@ -552,7 +663,7 @@ def train_sde(
                 
                 axes[0].plot(real_sample[:, 0], label='Real Asset A')
                 axes[0].plot(real_sample[:, 1], label='Real Asset B')
-                axes[0].set_title('Validation: Real Path (CumSum Log-Ret)')
+                axes[0].set_title('Validation: Scaled Log-Prices (Real)')
                 axes[0].legend()
                 
                 axes[1].plot(gen_sample[:, 0], label='Synth Asset A', linestyle='--')
@@ -566,30 +677,50 @@ def train_sde(
 
             if use_wandb:
                 metrics_dict = {
+                    # Losses principales
                     "train/mmd_loss": avg_train_loss,
                     "val/mmd_loss": avg_val_loss,
+                    
+                    # Overfitting gap (doit rester proche de 0)
+                    "val/overfit_gap": avg_val_loss - avg_train_loss,
+                    
+                    # Optimiseur
+                    "train/learning_rate": optimizer.param_groups[0]['lr'],
+                    "train/grad_norm": last_grad_norm,          # calculé juste avant
+                    
+                    # Early stopping (utile pour voir quand tu es proche du stop)
+                    "train/epochs_no_improve": epochs_no_improve,
+                    
+                    # Diagnostics SDE
+                    **extra_metrics,            # le dict calculé par _compute_extra_metrics
+                    
+                    # Axe X
                     "epoch": epoch,
-                    "train/learning_rate": optimizer.param_groups[0]['lr']
                 }
-                if fig_img is not None:
-                    metrics_dict["val/plot"] = fig_img
-                wandb.log(metrics_dict)
                 
-            # Early Stopping Logic
+                if fig_img is not None:
+                    metrics_dict["val/generated_paths"] = fig_img
+                
+                wandb.log(metrics_dict)
+
+                
+            # Early Stopping Logic (Validation sur modèle EMA)
             if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
                 epochs_no_improve = 0
                 # Sauvegarde du meilleur modèle (Validation)
                 os.makedirs("data/models", exist_ok=True)
-                torch.save(generator_sde.state_dict(), "data/models/best_val_sde.pt")
+                torch.save(ema_sde.module.state_dict(), "data/models/best_val_sde.pt")
             else:
-                epochs_no_improve += 10
+                epochs_no_improve += 1
                 
             if epochs_no_improve >= early_stop_patience:
                 print(f"🛑 Early stopping déclenché à l'epoch {epoch} (Patience={early_stop_patience} epochs sans amélioration).")
                 # Restauration des meilleurs poids
                 if os.path.exists("data/models/best_val_sde.pt"):
-                    generator_sde.load_state_dict(torch.load("data/models/best_val_sde.pt"))
+                    ema_sde.module.load_state_dict(
+                        torch.load("data/models/best_val_sde.pt", weights_only=True)
+                    )
                 break
 
-    return generator_sde
+    return ema_sde.module

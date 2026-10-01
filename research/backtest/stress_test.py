@@ -56,13 +56,12 @@ FEE_SCENARIOS = {
     ),
 }
 
-
 class RealisticCostModel:
     """
-    Cost model corrigé :
-    - 4 transactions par round-trip (open A, open B, close A, close B)
+    Cost model corrigé et uniformisé :
+    - Coût appliqué à CHAQUE transaction (ouverture OU fermeture)
+    - Une transaction = 2 legs simultanés (long A + short B)
     - Funding rate sur positions overnight
-    - Slippage volatility-adjusted (optionnel)
     """
 
     def __init__(self, scenario: FeeScenario):
@@ -71,30 +70,28 @@ class RealisticCostModel:
         self.slip     = scenario.slippage_bps / 10_000
         self.funding  = scenario.funding_rate_8h
 
-    def round_trip_cost(self, notional_per_leg: float) -> float:
+    def transaction_cost(self, notional_per_leg: float) -> float:
         """
-        Coût complet d'un aller-retour sur une paire.
-        4 transactions : open_A, open_B, close_A, close_B
+        Coût d'UNE transaction sur la paire (ouverture OU fermeture).
+        2 legs simultanés (Asset A + Asset B).
+        Un round-trip complet = 2 appels à cette fonction = 4 legs au total.
         """
-        cost_per_transaction = notional_per_leg * (self.fee + self.slip)
-        return cost_per_transaction * 4  # 4 legs
+        return notional_per_leg * (self.fee + self.slip) * 2
 
     def funding_cost_per_bar(
         self,
-        position: float,        # +1 / -1
-        notional: float,
+        position: float,
+        notional_per_leg: float,
         bar_hours: float = 1.0,
     ) -> float:
         """
         Funding rate crypto : payé toutes les 8h.
-        Short position reçoit le funding, long le paie (en général).
-        On est toujours long/short simultanément → funding net ≈ 0
-        MAIS si funding très élevé, l'un des legs paye plus.
-        Simplification conservative : on paie toujours.
+        On est long/short simultanément → en théorie les fundings se compensent,
+        MAIS en pratique les taux diffèrent → on paye conservativement sur les 2 legs.
         """
         funding_per_bar = self.funding * (bar_hours / 8.0)
-        # On multiplie par 2 pour couvrir grossièrement le notionnel sur les 2 legs
-        return abs(position) * notional * funding_per_bar * 2
+        return abs(position) * notional_per_leg * funding_per_bar * 2
+
 
 
 # ============================================================
@@ -102,82 +99,99 @@ class RealisticCostModel:
 # ============================================================
 
 class RealisticPnLEngine:
-    """
-    Corrige les bugs du PnLEngine original :
-    1. Beta-weighted spread return
-    2. 4 legs de coût
-    3. Funding rate
-    """
-
     def __init__(self, config: BacktestConfig, cost_model: RealisticCostModel):
         self.cfg   = config
         self.costs = cost_model
 
     def compute(
         self,
-        positions:  np.ndarray,
-        spreads:    np.ndarray,
-        price_a:    np.ndarray,
-        price_b:    np.ndarray,
-        betas:      np.ndarray,
-        bar_hours:  float = 1.0,
+        positions: np.ndarray,
+        spreads:   np.ndarray,
+        price_a:   np.ndarray,
+        price_b:   np.ndarray,
+        betas:     np.ndarray,
+        bar_hours: float = 1.0,
     ) -> pd.DataFrame:
 
         n = len(positions)
 
         # --- Returns bar-à-bar ---
-        ret_a = np.zeros(n)
-        ret_b = np.zeros(n)
-        ret_a[1:] = np.diff(price_a) / np.where(price_a[:-1] > 0, price_a[:-1], 1e-9)
-        ret_b[1:] = np.diff(price_b) / np.where(price_b[:-1] > 0, price_b[:-1], 1e-9)
-        ret_a = np.nan_to_num(ret_a, nan=0.0, posinf=0.0, neginf=0.0)
-        ret_b = np.nan_to_num(ret_b, nan=0.0, posinf=0.0, neginf=0.0)
+        ret_a    = np.zeros(n)
+        ret_b    = np.zeros(n)
+        ret_a[1:] = np.diff(price_a) / np.where(price_a[:-1] > 0, price_a[:-1], np.nan)
+        ret_b[1:] = np.diff(price_b) / np.where(price_b[:-1] > 0, price_b[:-1], np.nan)
+        ret_a    = np.nan_to_num(ret_a)
+        ret_b    = np.nan_to_num(ret_b)
 
-        # ✅ FIX 1 : Beta-weighted spread return
-        # Long A, Short beta*B → P&L = ret_a - beta * ret_b
-        beta_adjusted_return = ret_a - betas * ret_b
-
-        notional_per_leg = self.cfg.initial_capital * self.cfg.position_size
-
-        # Raw P&L (Fix look-ahead bias)
+        shifted_betas     = np.roll(betas, 1)
         shifted_positions = np.roll(positions, 1)
         shifted_positions[0] = 0.0
-        raw_pnl = shifted_positions * beta_adjusted_return * notional_per_leg
 
-        # ✅ FIX 2 : 4 legs sur round-trip
-        pos_change  = np.diff(positions, prepend=0.0)
-        is_entry    = (positions != 0) & (pos_change != 0)   # ouverture
-        is_exit     = (positions == 0) & (pos_change != 0)   # fermeture
+        spread_return = ret_a - shifted_betas * ret_b
+        spread_return = np.nan_to_num(spread_return, nan=0.0)
 
-        cost_per_bar = np.zeros(n)
+        # --- Boucle séquentielle : compounding + coûts détaillés ---
+        raw_pnl       = np.zeros(n)
+        cost_tx_arr   = np.zeros(n)   # coûts de transaction (fees + slippage)
+        cost_fund_arr = np.zeros(n)   # coûts de funding
+        notional_arr  = np.zeros(n)
+        capital       = np.full(n, self.cfg.initial_capital, dtype=np.float64)
 
-        # Coût à l'entrée
-        cost_per_bar[is_entry] = self.costs.round_trip_cost(notional_per_leg)
+        current_notional = 0.0
+        prev_pos         = 0.0
 
-        # ✅ FIX 3 : Funding rate (payé à chaque bar en position)
-        funding_per_bar = np.array([
-            self.costs.funding_cost_per_bar(positions[i], notional_per_leg, bar_hours)
-            for i in range(n)
-        ])
+        for i in range(1, n):
+            cap_prev = capital[i - 1]
+            pos_i    = positions[i]
 
-        total_cost = cost_per_bar + funding_per_bar
-        net_pnl    = raw_pnl - total_cost
+            transition = (pos_i != prev_pos)
 
-        capital = self.cfg.initial_capital + np.cumsum(net_pnl)
+            # --- 1) Coûts de transaction (ouverture / fermeture / flip) ---
+            if transition:
+                # Fermeture de l'ancienne position
+                if prev_pos != 0:
+                    cost_tx_arr[i] += self.costs.transaction_cost(current_notional)
+
+                # Ouverture de la nouvelle position
+                if pos_i != 0:
+                    new_notional = cap_prev * self.cfg.position_size
+                    cost_tx_arr[i] += self.costs.transaction_cost(new_notional)
+                    current_notional = new_notional
+                else:
+                    current_notional = 0.0
+
+            # --- 2) Funding cost (payé à chaque bar en position) ---
+            if current_notional > 0 and pos_i != 0:
+                cost_fund_arr[i] = self.costs.funding_cost_per_bar(
+                    pos_i, current_notional, bar_hours
+                )
+
+            # --- 3) P&L brut du bar ---
+            raw_pnl[i] = shifted_positions[i] * spread_return[i] * current_notional
+
+            # --- 4) Mise à jour capital ---
+            total_cost      = cost_tx_arr[i] + cost_fund_arr[i]
+            capital[i]      = cap_prev + raw_pnl[i] - total_cost
+            notional_arr[i] = current_notional
+            prev_pos        = pos_i
+
+        net_pnl = raw_pnl - cost_tx_arr - cost_fund_arr
 
         return pd.DataFrame({
-            "position":    positions,
-            "spread":      spreads,
-            "ret_a":       ret_a,
-            "ret_b":       ret_b,
-            "beta":        betas,
-            "raw_pnl":     raw_pnl,
-            "cost_tx":     cost_per_bar,
-            "cost_fund":   funding_per_bar,
-            "total_cost":  total_cost,
-            "net_pnl":     net_pnl,
-            "capital":     capital,
+            "position":   positions,
+            "spread":     spreads,
+            "ret_a":      ret_a,
+            "ret_b":      ret_b,
+            "beta_r":     shifted_betas,
+            "notional":   notional_arr,
+            "raw_pnl":    raw_pnl,
+            "cost_tx":    cost_tx_arr,
+            "cost_fund":  cost_fund_arr,
+            "cost":       cost_tx_arr + cost_fund_arr,  # total, pour compat avec PerformanceMetrics
+            "net_pnl":    net_pnl,
+            "capital":    capital,
         })
+
 
 
 # ============================================================
@@ -204,9 +218,10 @@ class StressTestEngine:
         pm         = PositionManager(self.bt_cfg)
 
         positions = pm.compute_positions(
-            signal.zscores,
             signal.entry_long,
             signal.entry_short,
+            signal.exit_signal,
+            dynamic_max_hold=168 # Default for stress testing
         )
 
         df = pnl_engine.compute(

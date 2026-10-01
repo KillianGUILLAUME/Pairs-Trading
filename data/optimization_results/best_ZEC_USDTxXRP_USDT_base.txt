@@ -1,0 +1,10 @@
+# Optimal params — ZEC_USDT × XRP_USDT (base)
+# Score: -2.8822 | Sharpe: -1.06
+
+entry_threshold: 1.7
+exit_threshold: 0.35
+zscore_window: 156
+position_size: 0.14
+stop_loss_z: 5.5
+max_holding_bars: 192
+cooldown_bars: 14

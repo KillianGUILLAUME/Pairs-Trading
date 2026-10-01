@@ -5,8 +5,9 @@ from loguru import logger
 from datetime import datetime
 from typing import Optional
 
+from data.connectors.base_connector import BaseConnector
 
-class BinanceConnector:
+class BinanceConnector(BaseConnector):
     """
     Connector Binance via CCXT.
     Gère la récupération des OHLCV et des métadonnées de marché.
@@ -27,6 +28,24 @@ class BinanceConnector:
             "options": {"defaultType": "spot"},  # spot ou future
         })
         logger.info("BinanceConnector initialisé")
+
+    def fetch(self, symbol: str, timeframe: str, start: Union[str, datetime], end: Union[str, datetime]) -> pd.DataFrame:
+        """Implémentation stricte du contrat BaseConnector."""
+        # Ton code initial (légèrement adapté pour les dates)
+        start_str = start if isinstance(start, str) else start.strftime("%Y-%m-%d")
+        end_str = end if isinstance(end, str) else end.strftime("%Y-%m-%d")
+        
+        # On utilise ta logique interne ultra-rapide en Polars
+        df_polars = self._fetch_ohlcv_internal(symbol, timeframe, start_str, end_str)
+        
+        # On convertit en Pandas pour la compatibilité avec le reste de ta stack (ML/PyTorch)
+        return df_polars.to_pandas()
+
+    def fetch_latest(self, symbol: str, timeframe: str, n_bars: int) -> pd.DataFrame:
+        """Récupère les dernières barres (Idéal pour amorcer l'IA)."""
+        candles = self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=n_bars)
+        df_polars = self._candles_to_dataframe(candles, symbol)
+        return df_polars.to_pandas()
 
     # ------------------------------------------------------------------
     # Universe

@@ -6,6 +6,7 @@ import iisignature
 
 def kalman_filter_spread(price_a: np.ndarray, price_b: np.ndarray, burn_in: int = 300) -> tuple:
     """
+    Not used in the final model.
     Calcule le spread adaptatif via Filtre de Kalman itératif pour éviter le data leakage.
     On utilise les premiers `burn_in` points (via OLS) pour initialiser l'état.
     Retourne (log_a, log_b, spread) où toutes les séries ont la taille originelle.
@@ -69,25 +70,26 @@ def kalman_filter_spread(price_a: np.ndarray, price_b: np.ndarray, burn_in: int 
 
 class CryptoPairsDataset(Dataset):
     """
-    Dataset pour la génération Seq2Seq.
-    Fournit les logs-prix et un Spread dynamique (par Filtre de Kalman)
-    sans lookahead bias.
+    Dataset pour la génération
+    Fournit les logs-prix.
     """
-    def __init__(self, price_a, price_b, seq_len=60, sig_depth=3, compute_signature=False, mean=None, std=None, burn_in=300):
+    def __init__(self, price_a, price_b, seq_len=60, stride=1, sig_depth=3, compute_signature=False, mean=None, std=None, burn_in=300):
         self.seq_len = seq_len
+        self.stride = stride
         self.sig_depth = sig_depth
         self.compute_signature = compute_signature
         
         # 1. Calcul des features (dont Spread filtré conditionnellement au passé)
-        log_a, log_b, spread = kalman_filter_spread(price_a, price_b, burn_in=burn_in)
+        # log_a, log_b, _ = kalman_filter_spread(price_a, price_b, burn_in=burn_in)
+        log_a = np.log(price_a)
+        log_b = np.log(price_b)
         
         # On ignore la période de burn_in
-        log_a = log_a[burn_in:]
-        log_b = log_b[burn_in:]
-        spread = spread[burn_in:]
+        # log_a = log_a[burn_in:]
+        # log_b = log_b[burn_in:]
+        # spread = spread[burn_in:]
         
-        # On a 3 features: [log_pA, log_pB, Spread]
-        self.raw_features = np.stack([log_a, log_b, spread], axis=1)
+        self.raw_features = np.stack([log_a, log_b], axis=1)
         
         # 2. Standardisation (centrage/réduction) proportionnelle
         if mean is not None and std is not None:
@@ -108,10 +110,12 @@ class CryptoPairsDataset(Dataset):
             self.signatures = None
 
     def _compute_all_signatures(self):
-        n_samples = len(self.scaled_features) - self.seq_len
+        # On pré-calcule les indices stridés
+        indices = self._get_valid_indices()
+        n_samples = len(indices)
 
         windows = sliding_window_view(self.scaled_features, self.seq_len, axis=0)
-        windows = np.swapaxes(windows, 1, 2)[:n_samples]
+        windows = np.swapaxes(windows, 1, 2)[indices]
 
         time_col = np.linspace(0, 1, self.seq_len).reshape(1, self.seq_len, 1)
         time_cols = np.repeat(time_col, n_samples, axis=0)
@@ -121,15 +125,26 @@ class CryptoPairsDataset(Dataset):
         
         return np.array(sigs, dtype=np.float32)
 
+    def _get_valid_indices(self):
+        """Retourne les indices de départ valides, espacés par le stride."""
+        max_start = len(self.scaled_features) - self.seq_len
+        return list(range(0, max_start, self.stride))
+
     def __len__(self):
-        return len(self.scaled_features) - self.seq_len
+        return len(self._get_valid_indices())
 
     def __getitem__(self, idx):
-        target_seq = self.scaled_features[idx : idx + self.seq_len]
-        target_seq_tensor = torch.tensor(target_seq, dtype=torch.float32)
+        # Convertir l'index du DataLoader en index réel dans la série
+        real_idx = self._get_valid_indices()[idx]
+        
+        past_path = self.scaled_features[real_idx : real_idx + self.seq_len]
+        target = self.scaled_features[real_idx + self.seq_len]
+        
+        past_path_tensor = torch.tensor(past_path, dtype=torch.float32)
+        target_tensor = torch.tensor(target, dtype=torch.float32)
         
         if self.compute_signature and self.signatures is not None:
             sig_tensor = torch.tensor(self.signatures[idx], dtype=torch.float32)
-            return target_seq_tensor, sig_tensor
+            return past_path_tensor, sig_tensor, target_tensor
             
-        return target_seq_tensor
+        return past_path_tensor, target_tensor

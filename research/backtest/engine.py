@@ -25,6 +25,7 @@ class BacktestConfig:
     fee_rate:         float = 0.0004
     slippage_bps:     float = 1.0
     beta_window:      int   = 120   # rolling OLS sur returns
+    cooldown_bars:    int   = 6
 
 # ============================================================
 # COST MODEL
@@ -60,7 +61,6 @@ class PositionManager:
         position   = 0
         entry_bar  = 0
         cooldown   = 0
-        COOLDOWN_BARS = 0
 
         for i in range(1, n):
 
@@ -83,7 +83,7 @@ class PositionManager:
 
                 if exit_signal[i] or max_hold_reached:
                     if holding < 12:
-                        cooldown = COOLDOWN_BARS
+                        cooldown = self.cfg.cooldown_bars
                     position = 0
 
             positions[i] = position
@@ -105,7 +105,8 @@ class PnLEngine:
         spreads:   np.ndarray,
         price_a:   np.ndarray,
         price_b:   np.ndarray,
-        betas:     np.ndarray,   # ignoré — recalculé en espace returns
+        betas:     np.ndarray,
+        allocations: Optional[np.ndarray] = None,
     ) -> pd.DataFrame:
 
         n = len(positions)
@@ -118,39 +119,64 @@ class PnLEngine:
         ret_a    = np.nan_to_num(ret_a)
         ret_b    = np.nan_to_num(ret_b)
 
-        shifted_betas = np.roll(betas, 1)
-
-        # --- Spread return beta-hedged (Avec le Kalman Beta) ---
-        spread_return = ret_a - shifted_betas * ret_b
-
-        # --- Notional fixe sur le leg A ---
-        notional = self.cfg.initial_capital * self.cfg.position_size
-
+        shifted_betas     = np.roll(betas, 1)
         shifted_positions = np.roll(positions, 1)
         shifted_positions[0] = 0.0
 
-        raw_pnl = shifted_positions * spread_return * notional
-        raw_pnl = np.nan_to_num(raw_pnl, nan=0.0)
+        spread_return = ret_a - shifted_betas * ret_b
+        spread_return = np.nan_to_num(spread_return, nan=0.0)
 
-        # --- Coûts aux transitions uniquement ---
-        pos_change   = np.diff(positions, prepend=0.0)
+        # --- Boucle séquentielle : capital et notional compound ---
+        raw_pnl      = np.zeros(n)
         cost_per_bar = np.zeros(n)
-        cost_per_bar[pos_change != 0] = self.costs.transaction_cost(notional)
+        notional_arr = np.zeros(n)
+        capital      = np.full(n, self.cfg.initial_capital, dtype=np.float64)
+
+        current_notional = 0.0   # notional par leg, figé à l'entrée du trade courant
+        prev_pos         = 0.0
+
+        for i in range(1, n):
+            cap_prev = capital[i - 1]
+            pos_i    = positions[i]
+
+            transition = (pos_i != prev_pos)
+
+            if transition:
+                # 1) On ferme l'ancienne position si elle existait (coût sur le notional figé)
+                if prev_pos != 0:
+                    cost_per_bar[i] += self.costs.transaction_cost(current_notional)
+
+                # 2) On ouvre la nouvelle position si pos_i != 0 (coût sur le nouveau notional)
+                if pos_i != 0:
+                    alloc_i = float(allocations[i]) if allocations is not None else float(self.cfg.position_size)
+                    new_notional = cap_prev * alloc_i
+                    cost_per_bar[i] += self.costs.transaction_cost(new_notional)
+                    current_notional = new_notional
+                else:
+                    current_notional = 0.0
+
+            # P&L du bar (position shiftée pour éviter le look-ahead)
+            raw_pnl[i] = shifted_positions[i] * spread_return[i] * current_notional
+
+            capital[i]      = cap_prev + raw_pnl[i] - cost_per_bar[i]
+            notional_arr[i] = current_notional
+            prev_pos        = pos_i
 
         net_pnl = raw_pnl - cost_per_bar
-        capital = self.cfg.initial_capital + np.cumsum(net_pnl)
 
         return pd.DataFrame({
             "position":  positions,
             "spread":    spreads,
             "ret_a":     ret_a,
             "ret_b":     ret_b,
-            "beta_r":    shifted_betas, #kalman beta
+            "beta_r":    shifted_betas,
+            "notional":  notional_arr,
             "raw_pnl":   raw_pnl,
             "cost":      cost_per_bar,
             "net_pnl":   net_pnl,
             "capital":   capital,
         })
+
 
 # ============================================================
 # PERFORMANCE METRICS
@@ -243,16 +269,16 @@ class BacktestEngine:
         self.pm         = PositionManager(self.cfg)
         self.pnl_engine = PnLEngine(self.cfg, self.costs)
 
-    def run(self, signal, label: str = "") -> dict:
+    def run(self, signal, label: str = "", allocations: Optional[np.ndarray] = None) -> dict:
 
-        label = label or f"{signal.symbol_a}×{signal.symbol_b}"
+        # label = label or f"{signal.symbol_a}×{signal.symbol_b}"
         # logger.info(f"Running backtest : {label}")
 
         hl = compute_kalman_halflife(signal.spreads)
         time_factor = 2.0
         dynamic_max_hold = max(int(hl * time_factor), 20)
 
-        print(f'Dynamic Half Life : {hl}')
+        # print(f'Dynamic Half Life : {hl}')
         positions = self.pm.compute_positions(
             signal.entry_long,
             signal.entry_short,
@@ -266,16 +292,17 @@ class BacktestEngine:
             signal.price_a,
             signal.price_b,
             signal.betas,
+            allocations=allocations,
         )
 
         metrics = PerformanceMetrics.compute(df)
 
-        logger.info(
-            f"{label:35s} | "
-            f"Sharpe={metrics['sharpe']:6.3f} | "
-            f"Ret={metrics['total_return_pct']:8.2f}% | "
-            f"MDD={metrics['max_dd']:7.2f}% | "
-            f"Trades={metrics['n_trades']}"
-        )
+        # logger.info(
+        #     f"{label:35s} | "
+        #     f"Sharpe={metrics['sharpe']:6.3f} | "
+        #     f"Ret={metrics['total_return_pct']:8.2f}% | "
+        #     f"MDD={metrics['max_dd']:7.2f}% | "
+            # f"Trades={metrics['n_trades']}"
+        # )
 
         return {"metrics": metrics, "df": df, "positions": positions}
