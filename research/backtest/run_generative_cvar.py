@@ -104,7 +104,9 @@ def run_generative_cvar(pair_a, pair_b, n_paths=200, bars=2000):
     sde_model_path = os.path.join(models_dir, sde_models[0])
     logger.info(f"Loading Neural SDE from {sde_model_path}...")
         
-    synths_path = os.path.join(project_root, "data", "storage", "synthetic_paths", f"{pair_a}x{pair_b}_{n_paths}.parquet")
+    # Cache indexé par paire, nombre de chemins, horizon ET modèle (un cache sans le modèle devenait périmé).
+    model_stem = os.path.splitext(sde_models[0])[0]
+    synths_path = os.path.join(project_root, "data", "storage", "synthetic_paths", f"{pair_a}x{pair_b}_{n_paths}_{bars}_{model_stem}.parquet")
     
     p_a_init = df_a.iloc[-bars]
     p_b_init = df_b.iloc[-bars]
@@ -116,7 +118,18 @@ def run_generative_cvar(pair_a, pair_b, n_paths=200, bars=2000):
     else:
         logger.info(f"⏳ Génération de {n_paths} trajectoires mathématiques (SDE Multiverse)...")
         sde_engine = GenerativeSDEEngine(model_path=sde_model_path)
-        synthetic_markets = sde_engine.simulate_markets(n_paths=n_paths, bars=bars, p_a_init=p_a_init, p_b_init=p_b_init)
+        # Conditionnement causal sur l'historique réel précédant le point d'ancrage (si le checkpoint le permet)
+        conditions = None
+        if sde_engine.conditioning is not None:
+            W = int(sde_engine.conditioning["past_window"]) + 1
+            conditions = sde_engine.conditions_from_history(
+                np.log(df_a.values[-bars - W:-bars + 1].astype(float)), np.log(df_b.values[-bars - W:-bars + 1].astype(float)),
+                np.log(df_btc.values[-bars - W:-bars + 1].astype(float)), np.log(df_eth.values[-bars - W:-bars + 1].astype(float)),
+            )
+            logger.info("🧭 Conditionnement causal calculé sur l'historique réel.")
+        else:
+            logger.warning("Checkpoint sans métadonnées de conditionnement : génération avec conditions nulles (fenêtre moyenne).")
+        synthetic_markets = sde_engine.simulate_markets(n_paths=n_paths, bars=bars, p_a_init=p_a_init, p_b_init=p_b_init, conditions=conditions)
         
         # Caching
         os.makedirs(os.path.dirname(synths_path), exist_ok=True)
@@ -127,6 +140,7 @@ def run_generative_cvar(pair_a, pair_b, n_paths=200, bars=2000):
     # 6. Evaluation Walk-Forward sur les univers synthétiques
     all_pure = []
     all_xgb = []
+    n_divergent = 0
     
     log_btc = np.log(price_btc.astype(float))
     log_eth = np.log(price_eth.astype(float))
@@ -136,11 +150,11 @@ def run_generative_cvar(pair_a, pair_b, n_paths=200, bars=2000):
         price_a = market_df["SYNTH_A"].values.astype(float)
         price_b = market_df["SYNTH_B"].values.astype(float)
         
-        # Absolute safety net to prevent SDE divergence crashes in Sklearn Walk-Forward
-        price_a = np.nan_to_num(price_a, nan=100.0, posinf=100.0, neginf=100.0)
-        price_b = np.nan_to_num(price_b, nan=100.0, posinf=100.0, neginf=100.0)
-        price_a = np.clip(price_a, 1e-8, 1e8)
-        price_b = np.clip(price_b, 1e-8, 1e8)
+        # Un chemin divergent (prix non finis ou > x1000) est REJETÉ et compté, pas masqué.
+        if (not np.all(np.isfinite(price_a)) or not np.all(np.isfinite(price_b))
+                or price_a.max() / price_a.min() > 1e3 or price_b.max() / price_b.min() > 1e3):
+            n_divergent += 1
+            continue
         
         # A. Stat ArB Pure
         signal = sig_gen.generate(timestamps, price_a, price_b, symbol_a=pair_a, symbol_b=pair_b)
@@ -191,6 +205,11 @@ def run_generative_cvar(pair_a, pair_b, n_paths=200, bars=2000):
         all_xgb.append(metric_xgb)
         
     # 7. Agrégation Statistique et Calculs CVaR (95%)
+    if n_divergent:
+        logger.warning(f"⚠️ {n_divergent}/{n_paths} trajectoires divergentes rejetées (le taux doit rester marginal).")
+    if not all_pure:
+        logger.error("Aucune trajectoire exploitable.")
+        return
     df_pure = pd.DataFrame(all_pure)
     df_xgb = pd.DataFrame(all_xgb)
     

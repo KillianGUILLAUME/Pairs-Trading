@@ -2,32 +2,14 @@ import math
 import torch
 import torch.nn as nn
 try:
-    import signatory
-    HAS_SIGNATORY = True
-    if torch.cuda.is_available():
-        print("⚡ Signatory GPU backend loaded successfully.")
-    else:
-        print("⚡ Signatory loaded (CPU mode).")
+    from neural_nets.signature_torch import signature as _signature
 except ImportError:
-    import iisignature
-    HAS_SIGNATORY = False
-    print("⚠️ Signatory not found. Falling back to iisignature (CPU only) for Mac compatibility.")
+    from signature_torch import signature as _signature
+
 
 def compute_path_signature(path_tensor: torch.Tensor, depth: int) -> torch.Tensor:
-    """
-    Calcule la signature du chemin de manière agnostique à l'environnement.
-    - AWS (Linux/CUDA) : Utilise 'signatory' directement sur le GPU.
-    - Mac (Local) : Fait le pont vers 'iisignature' sur le CPU en toute sécurité.
-    """
-    if HAS_SIGNATORY:
-        # Exécution native sur GPU, aucune copie mémoire
-        return signatory.signature(path_tensor, depth)
-    else:
-        # Fallback Mac : On sécurise le transfert vers le CPU et Numpy
-        device = path_tensor.device
-        path_np = path_tensor.detach().cpu().numpy()
-        sig_raw = iisignature.sig(path_np, depth)
-        return torch.tensor(sig_raw, dtype=torch.float32, device=device)
+    """Signature tronquée différentiable en pur torch (CPU/CUDA/MPS)."""
+    return _signature(path_tensor, depth)
 
 def compute_sig_channels(dim: int, depth: int) -> int:
     return sum(dim ** i for i in range(1, depth + 1))

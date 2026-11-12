@@ -1,26 +1,31 @@
-# Data
+# Données
 ccxt
 python-binance
 polars
 pyarrow
 pyyaml
+pandas
+numpy<2
+
+# Calcul / ML
+scipy
+scikit-learn
+statsmodels
+xgboost
+hmmlearn
+optuna
+joblib
+torch>=2.1             # sur AWS : installé avant via l'index cu118 (voir launcher.py)
+torchsde
 
 # Utils
 loguru
 tqdm
 python-dotenv
-numpy<2
-ipykernel
-matplotlib
-scikit-learn
-statsmodels
-seaborn
-iisignature
-optuna
-torch==2.1.2
-signatory==1.2.6.1.9.0
-torchsde
-
-pandas
 wandb
+boto3
+fabric
 matplotlib
+seaborn
+ipykernel
+pytest

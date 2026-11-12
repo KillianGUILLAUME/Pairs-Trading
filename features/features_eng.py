@@ -1,5 +1,4 @@
 import numpy as np
-import torch
 from statsmodels.tsa.stattools import adfuller
 from scipy.stats import t as student_t
 from scipy.stats import skewnorm
@@ -15,40 +14,88 @@ def compute_adf_pvalue(spread: np.ndarray) -> float:
     except Exception:
         return 1.0 
 
-def compute_hurst_exponent(series: np.ndarray) -> float:
-    n = len(series)
-    if n < 20: return 0.5
-    
+def _hurst_rs(increments: np.ndarray) -> float:
+    """Analyse R/S (Hurst 1951) appliquée aux INCRÉMENTS d'un processus."""
+    n = len(increments)
+    if n < 20:
+        return 0.5
     max_k = min(n // 2, 128)
-    sizes = []
-    rs_values = []
-    
+    sizes, rs_values = [], []
     for size in [16, 20, 24, 32, 40, 48, 64, 80, 96, max_k]:
-        if size > max_k or size < 8: continue
+        if size > max_k or size < 8:
+            continue
         n_chunks = n // size
-        if n_chunks < 1: continue
-            
+        if n_chunks < 1:
+            continue
         rs_list = []
         for i in range(n_chunks):
-            chunk = series[i * size : (i + 1) * size]
-            mean_chunk = np.mean(chunk)
-            deviations = np.cumsum(chunk - mean_chunk)
+            chunk = increments[i * size:(i + 1) * size]
+            deviations = np.cumsum(chunk - np.mean(chunk))
             R = np.max(deviations) - np.min(deviations)
             S = np.std(chunk, ddof=1)
-            if S > 1e-10: rs_list.append(R / S)
-        
+            if S > 1e-10:
+                rs_list.append(R / S)
         if rs_list:
             sizes.append(size)
             rs_values.append(np.mean(rs_list))
-    
-    if len(sizes) < 3: return 0.5
-    
-    log_sizes, log_rs = np.log(sizes), np.log(rs_values)
+    if len(sizes) < 3:
+        return 0.5
     try:
-        coeffs = np.polyfit(log_sizes, log_rs, 1)
+        coeffs = np.polyfit(np.log(sizes), np.log(rs_values), 1)
         return float(np.clip(coeffs[0], 0.0, 1.0))
     except Exception:
         return 0.5
+
+
+def _hurst_variogram(series: np.ndarray, max_lag: int = 32) -> float:
+    """
+    Exposant de Hurst généralisé par variogramme (sur les NIVEAUX) :
+        τ(ℓ) = sqrt(Var(S_{t+ℓ} - S_t)),   log τ(ℓ) ≈ H log ℓ + C.
+    Marche aléatoire -> 0.5 ; OU (variogramme saturant) -> < 0.5 ; tendance -> > 0.5.
+    C'est l'estimateur décrit dans le README (§2.5).
+    """
+    n = len(series)
+    if n < 20:
+        return 0.5
+    lags = [lag for lag in (1, 2, 3, 4, 6, 8, 12, 16, 24, 32) if lag <= min(max_lag, n // 4)]
+    if len(lags) < 3:
+        return 0.5
+    taus = []
+    for lag in lags:
+        d = series[lag:] - series[:-lag]
+        # Moment d'ordre 2 NON centré (variogramme classique) : sans biais pour une
+        # marche aléatoire ; np.var (centré) sous-estime aux grands lags à cause du
+        # chevauchement des différences.
+        v = np.mean(d ** 2)
+        taus.append(np.sqrt(v) if v > 1e-18 else np.nan)
+    taus = np.array(taus)
+    ok = np.isfinite(taus)
+    if ok.sum() < 3:
+        return 0.5
+    try:
+        slope = np.polyfit(np.log(np.array(lags)[ok]), np.log(taus[ok]), 1)[0]
+        return float(np.clip(slope, 0.0, 1.0))
+    except Exception:
+        return 0.5
+
+
+def compute_hurst_exponent(series: np.ndarray, method: str = "variogram") -> float:
+    """
+    Exposant de Hurst d'un processus donné par ses NIVEAUX (ex. le spread).
+        H < 0.5 : retour à la moyenne ; H = 0.5 : marche aléatoire ; H > 0.5 : tendance.
+
+    method="variogram" (défaut) : variogramme sur les niveaux (README §2.5).
+    method="rs"                 : analyse R/S appliquée aux incréments np.diff(series).
+
+    Correctif (audit 2026-11) : l'ancienne version appliquait R/S directement aux
+    niveaux, ce qui traite le spread comme une série d'incréments et renvoie
+    H ≈ 0.9-1.0 même pour un OU fortement mean-reverting.
+    """
+    series = np.asarray(series, dtype=float)
+    if method == "rs":
+        return _hurst_rs(np.diff(series))
+    return _hurst_variogram(series)
+
 
 def compute_half_life(spread: np.ndarray) -> float:
     n = len(spread)
@@ -110,16 +157,39 @@ def compute_ou_mle(spread: np.ndarray, dt: float = 1.0) -> dict:
             
     return {"theta": round(float(theta), 6), "mu": round(float(mu), 6), "sigma": round(float(sigma), 6)}
 
-def compute_tail_risk(returns: np.ndarray) -> float:
+def compute_tail_risk(returns: np.ndarray, fast: bool = False) -> float:
+    """
+    Degrés de liberté ν d'une Student-t ajustée aux rendements (queues épaisses si ν petit).
+    fast=False : MLE scipy (~50 ms) ; fast=True : méthode des moments, ν = 4 + 6/κ_excès
+    (ν clippé à [2.1, 30]).
+    """
+    returns = np.asarray(returns, dtype=float)
     if len(returns) < 10: return 30.0
+    if fast:
+        x = returns - np.mean(returns)
+        m2 = np.mean(x ** 2)
+        if m2 < 1e-18: return 30.0
+        kurt_excess = np.mean(x ** 4) / (m2 ** 2) - 3.0
+        if kurt_excess <= 0.2: return 30.0
+        return float(np.clip(4.0 + 6.0 / kurt_excess, 2.1, 30.0))
     try:
         nu, loc, scale = student_t.fit(returns)
         return float(np.clip(nu, 1.0, 30.0))
     except Exception:
         return 30.0
 
-def compute_asymmetry(returns: np.ndarray) -> float:
+def compute_asymmetry(returns: np.ndarray, fast: bool = False) -> float:
+    """
+    Asymétrie des rendements. fast=False : paramètre α d'une skew-normale (MLE scipy, ~50 ms) ;
+    fast=True : coefficient d'asymétrie empirique (moment d'ordre 3 standardisé), clippé à [-10, 10].
+    """
+    returns = np.asarray(returns, dtype=float)
     if len(returns) < 10: return 0.0
+    if fast:
+        x = returns - np.mean(returns)
+        s = np.sqrt(np.mean(x ** 2))
+        if s < 1e-12: return 0.0
+        return float(np.clip(np.mean(x ** 3) / s ** 3, -10.0, 10.0))
     try:
         a, loc, scale = skewnorm.fit(returns)
         return float(np.clip(a, -10.0, 10.0))
@@ -150,8 +220,35 @@ def compute_merton_jumps_pseudo_mle(returns: np.ndarray) -> tuple:
 # API de Haut-Niveau (Wrappers)
 # ============================================================
 
-def get_screener_feature_dict(log_a: np.ndarray, log_b: np.ndarray, log_btc: np.ndarray, log_eth: np.ndarray) -> dict:
-    """ Computes and returns the dictionary of all generative features for the dataset """
+SCREENER_FEATURE_KEYS = [
+    "adf_pvalue", "hurst", "half_life", "ou_theta", "ou_mu", "ou_sigma",
+    "btc_return_24h", "btc_vol_72h", "eth_btc_ratio",
+    "student_nu", "skew_alpha", "jump_lambda", "jump_sigma",
+]
+
+def get_window_diagnostics(log_a: np.ndarray, log_b: np.ndarray) -> dict:
+    """
+    Diagnostics de stationnarité d'une fenêtre (ADF, Hurst, demi-vie, OU).
+    Utilisé par le screener sur la fenêtre CIBLE, pour la curation du dataset
+    uniquement : ces valeurs ne doivent jamais servir de conditionnement.
+    """
+    spread = log_a - log_b
+    ou = compute_ou_mle(spread, dt=1.0)
+    return {
+        "adf_pvalue": compute_adf_pvalue(spread),
+        "hurst": compute_hurst_exponent(spread),
+        "half_life": compute_half_life(spread),
+        "ou_theta": ou["theta"], "ou_mu": ou["mu"], "ou_sigma": ou["sigma"],
+    }
+
+def get_screener_feature_dict(log_a: np.ndarray, log_b: np.ndarray, log_btc: np.ndarray, log_eth: np.ndarray,
+                              fast: bool = False) -> dict:
+    """
+    Descripteurs d'une fenêtre de log-prix (13 clés, ordre `SCREENER_FEATURE_KEYS`).
+    Les features macro (BTC / ETH) sont évaluées à la FIN de la fenêtre : pour un
+    conditionnement causal, passer la fenêtre PASSÉE [t-W, t).
+    fast=True : estimateurs de queue/asymétrie par moments (screener, ~10x plus rapide).
+    """
     spread = log_a - log_b
     returns = np.diff(spread)
     
@@ -159,8 +256,8 @@ def get_screener_feature_dict(log_a: np.ndarray, log_b: np.ndarray, log_btc: np.
     hurst = compute_hurst_exponent(spread)
     half_life = compute_half_life(spread)
     ou_params = compute_ou_mle(spread, dt=1.0)
-    nu = compute_tail_risk(returns)
-    alpha = compute_asymmetry(returns)
+    nu = compute_tail_risk(returns, fast=fast)
+    alpha = compute_asymmetry(returns, fast=fast)
     lambda_jump, sigma_jump = compute_merton_jumps_pseudo_mle(returns)
     
     n_bars = len(log_btc)
@@ -187,54 +284,14 @@ def get_screener_feature_dict(log_a: np.ndarray, log_b: np.ndarray, log_btc: np.
         "jump_sigma": sigma_jump,
     }
 
-def get_inference_tensor(
-    log_a: np.ndarray, 
-    log_b: np.ndarray, 
-    log_btc: np.ndarray, 
-    log_eth: np.ndarray,
-    scaler_mean: np.ndarray = None,
-    scaler_std: np.ndarray = None
-) -> torch.Tensor:
+def get_inference_tensor(*args, **kwargs):
     """
-    Computes all features on the fly and returns the 1x10 conditional tensor.
-    Sert au conditionnement "Live" du modèle SDE (Génération/Walk-Forward).
+    OBSOLÈTE (audit 2026-11) : renvoyait des features brutes non standardisées avec
+    un scaling par asset, incompatible avec l'entraînement (z-score des conditions +
+    ancrage global). Utiliser `GenerativeSDEEngine.conditions_from_history(...)`,
+    qui applique exactement la standardisation stockée dans le checkpoint.
     """
-    d = get_screener_feature_dict(log_a, log_b, log_btc, log_eth)
-
-    if scaler_mean is None or scaler_std is None:
-        raw_points = np.stack([log_a, log_b], axis=-1)
-        scaler_mean = np.mean(raw_points, axis=0)
-        scaler_std = np.std(raw_points, axis=0)
-        scaler_std = np.where(scaler_std == 0, 1e-8, scaler_std)
-        
-    # On isole les prix au temps T=0
-    price_a_0 = log_a[0]
-    price_b_0 = log_b[0]
-    
-    # On applique la standardisation exacte de l'entraînement
-    norm_a_0 = (price_a_0 - scaler_mean[0]) / scaler_std[0]
-    norm_b_0 = (price_b_0 - scaler_mean[1]) / scaler_std[1]
-    
-    # On calcule le spread normalisé
-    initial_spread = norm_a_0 - norm_b_0
-
-    d["initial_spread"] = initial_spread
-    
-    metrics = torch.tensor([
-        d["adf_pvalue"],
-        d["hurst"],
-        min(d["half_life"], 500.0),
-        d["ou_theta"],
-        d["ou_mu"],
-        d["ou_sigma"],
-        d["btc_return_24h"],
-        d["btc_vol_72h"],
-        d["eth_btc_ratio"],
-        d["student_nu"],
-        d["skew_alpha"],
-        d["jump_lambda"],
-        d["jump_sigma"],
-        d["initial_spread"]
-    ], dtype=torch.float32).unsqueeze(0)  # Shape (1, 13)
-    
-    return metrics
+    raise NotImplementedError(
+        "get_inference_tensor est obsolète : utiliser "
+        "research.backtest.generative_sde_engine.GenerativeSDEEngine.conditions_from_history"
+    )

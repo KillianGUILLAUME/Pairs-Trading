@@ -2,7 +2,10 @@ import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
 import torch
 from torch.utils.data import Dataset
-import iisignature
+try:
+    from neural_nets.signature_torch import sig_np
+except ImportError:
+    from signature_torch import sig_np
 
 def kalman_filter_spread(price_a: np.ndarray, price_b: np.ndarray, burn_in: int = 300) -> tuple:
     """
@@ -121,7 +124,7 @@ class CryptoPairsDataset(Dataset):
         time_cols = np.repeat(time_col, n_samples, axis=0)
 
         paths_with_time = np.concatenate([time_cols, windows], axis=2)
-        sigs = iisignature.sig(paths_with_time, self.sig_depth)
+        sigs = sig_np(paths_with_time, self.sig_depth)
         
         return np.array(sigs, dtype=np.float32)
 

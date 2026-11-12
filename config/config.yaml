@@ -23,28 +23,53 @@ logging:
   format: "{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}"
 
 neural_net:
+  data:
+    # Dataset CAUSAL produit par research/pairs/build_screened_dataset.py
+    dataset_path: "data/storage/screened/super_dataset_SDE_128_causal.parquet"
+    max_adf_pvalue: 0.15       # curation : fenêtres cibles stationnaires
+    filter_on: "target"        # "target" (défaut) ou "cond" (inclut les ruptures de cointégration)
+    train_frac: 0.8            # split chronologique
+    embargo_bars: 128          # fenêtres de validation chevauchant la fin du train écartées
   model:
     data_dim: 2
-    time_dim: 64
-    sig_depth: 3
     hidden_dim: 256
+    min_vol: 0.0001
+    dt_sde: 0.5                # pas d'intégration (barre = 1.0) -> 2 sous-pas Euler par barre (2x plus rapide que 0.25)
+    sde_solver: "euler"        # chemin historique (torchsde), utilisé seulement si aucune extension ci-dessous n'est active
+    # Extensions du processus (intégrateur Euler maison dès qu'une est active)
+    latent_dim: 1              # volatilité stochastique latente (0 = aucune)
+    noise: "student"           # "gaussian" ou "student" (queues épaisses, nu appris)
+    student_nu: 6.0
+    mean_reversion: true       # rappel explicite du spread, theta(c) et m(c) conditionnés
+    sig_depth: 3
+    sig_time_augment: true     # canal temps : indispensable (invariance par reparamétrisation sinon)
+    sig_lead_lag: true         # variance quadratique visible dans la signature (profondeur 3 conservée)
+    # (CFM / DSBM, dormant)
+    time_dim: 64
     depth: 3
   training:
-    epochs: 500 #1000
+    seed: 42
+    epochs: 50                 # ~7 min/époque sur CPU à dt=0.25 ; dt=0.5 divise par ~2
     batch_size: 512
     learning_rate: 0.0001
     weight_decay: 0.01
+    accum_iter: 4
+    ema_decay: 0.99            # ~1100 pas au total (50 époques) : demi-vie ~70 pas
+    early_stop_patience: 10
+    val_every: 2               # validation = intégration SDE complète sur le val set (coûteux) ; 5 pour aller plus vite
+    max_batches_per_epoch: null
+    # (CFM / DSBM, dormant)
     lambda_entropy: 0.1
     min_variance: 0.1
     seq_len: 128
     stride: 8
-    interpolant: "linear"  # Options: "linear", "brownian_bridge"
-    sigma_dsbm: 0.5                 # Sigma utilisé pour le Brownian Bridge
+    interpolant: "linear"      # Options: "linear", "brownian_bridge"
+    sigma_dsbm: 0.5
     theta_ou: 0.05
     sigma_ou: 0.5
   generation:
     n_ode_steps: 35
     n_mart_samples: 8
     target_drift: 0.0
-    solver: "ode"                   # Options: "ode" (RK4) ou "sde" (Euler Maruyama)
-    sigma_sde: 0.5                  # Sigma pour réinjonction du bruit (fat tails)
+    solver: "ode"
+    sigma_sde: 0.5

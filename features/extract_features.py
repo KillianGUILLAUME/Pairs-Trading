@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-import iisignature
+from neural_nets.signature_torch import sig_np
 from loguru import logger
 
 from research.signals.signal_generator import SignatureFeatures, SignalGenerator
@@ -59,7 +59,7 @@ def extract_hybrid_ml_dataset(markets_list, sig_cfg, label_cfg, window=50, depth
             z_win = signal.zscores[idx - window + 1 : idx + 1]
             
             path = sig_extractor._build_path(t_win, s_win, z_win)
-            signature = iisignature.sig(path, depth)
+            signature = sig_np(path, depth)
             
             # 🚀 LA FUSION MAGIQUE (On colle les stats à la suite de la signature)
             # On enlève 'entry_idx' et 'direction' des features statistiques pour ne garder que les maths

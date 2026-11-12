@@ -1,226 +1,239 @@
+"""
+neural_nets/train.py
+
+Entraînement de la Neural SDE conditionnelle (Kernel Signature MMD).
+
+    python neural_nets/train.py                 # config/config.yaml
+    python neural_nets/train.py --smoke         # 2 époques, 3 batches : vérifie que tout tourne
+
+Le checkpoint final contient : poids, config, facteur d'échelle global, scalers de
+signature, métadonnées de conditionnement (colonnes, z-score, spread initial),
+paramètres de signature et dataset utilisé — tout ce qu'il faut pour que l'inférence
+(`GenerativeSDEEngine`) reproduise exactement le prétraitement de l'entraînement.
+"""
+
+import argparse
 import os
-import yaml
-import torch
-import numpy as np
-import wandb
-from torch.utils.data import DataLoader
+import subprocess
+import sys
 from datetime import datetime
 
+import numpy as np
+import torch
+import yaml
+from torch.utils.data import DataLoader, Subset
+
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+from neural_nets.losses import train_sde                      # noqa: E402
+from neural_nets.neural_sde import GeneratorSDE               # noqa: E402
+from neural_nets.screened_loader import ScreenedPairsDataset  # noqa: E402
+
 torch.backends.cudnn.benchmark = True
-# torch.backends.cuda.matmul.allow_tf32 = True
-# torch.backends.cudnn.allow_tf32 = True
-# torch.set_float32_matmul_precision('high')
-
-# Importer les modules locaux
-from data_loader import CryptoPairsDataset
-from screened_loader import ScreenedPairsDataset
-from neural_sde import GeneratorSDE
-from losses import train_sde
 
 
-def load_config(config_path="config/config.yaml"):
+def load_config(config_path):
     with open(config_path, "r") as f:
         return yaml.safe_load(f)
 
-import pandas as pd
+
+def _sha256(path, chunk=1 << 20):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(chunk), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def _git_commit():
+    try:
+        return subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], cwd=project_root,
+                                       stderr=subprocess.DEVNULL).decode().strip()
+    except Exception:
+        return None
+
+
+def chronological_split(dataset: ScreenedPairsDataset, train_frac: float, embargo_bars: int):
+    """
+    Split chronologique (le dataset est trié par timestamp_start) avec embargo : les
+    fenêtres de validation qui chevauchent la fin du train (moins de `embargo_bars`
+    barres après la dernière fenêtre de train) sont écartées.
+    """
+    n = len(dataset)
+    train_size = int(train_frac * n)
+    train_idx = list(range(0, train_size))
+    if dataset.timestamps_start is None or embargo_bars <= 0:
+        return train_idx, list(range(train_size, n))
+    ts = dataset.timestamps_start.astype(np.int64)
+    bar_ms = 3600 * 1000
+    cutoff = ts[:train_size].max() + embargo_bars * bar_ms
+    val_idx = [i for i in range(train_size, n) if ts[i] >= cutoff]
+    return train_idx, val_idx
+
 
 def main():
-    # 1. Charger la configuration
-    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    config_path = os.path.join(project_root, "config", "config.yaml")
-    
-    if not os.path.exists(config_path):
-        raise FileNotFoundError(f"Fichier de config introuvable : {config_path}")
-    
-    config = load_config(config_path)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default=os.path.join(project_root, "config", "config.yaml"))
+    parser.add_argument("--smoke", action="store_true", help="Run minimal (2 époques, 3 batches) pour vérifier la chaîne")
+    parser.add_argument("--device", default=None)
+    args = parser.parse_args()
+
+    if not os.path.exists(args.config):
+        raise FileNotFoundError(f"Fichier de config introuvable : {args.config}")
+    config = load_config(args.config)
     nn_config = config.get("neural_net", {})
     if not nn_config:
         raise ValueError("Le bloc 'neural_net' est manquant dans config.yaml.")
-    
+
     model_cfg = nn_config["model"]
     train_cfg = nn_config["training"]
+    data_cfg = nn_config.get("data", {})
 
-    device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
-    print(f"Appareil utilisé pour l'entraînement : {device.upper()}")
-    
-    print(f"Modèle Actif : Conditional Neural SDE (Drift + Diffusion)")
+    seed = int(train_cfg.get("seed", 42))
+    torch.manual_seed(seed)
+    np.random.seed(seed)
 
-    # 2. Préparer les données
+    device = args.device or ("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
+    print(f"Appareil utilisé pour l'entraînement : {device.upper()} | seed={seed}")
+    print("Modèle actif : Conditional Neural SDE (Drift + Diffusion), loss = Kernel Signature MMD (canal temps)")
 
-    super_dataset_path = os.path.join(project_root, "data", "storage", "screened", "super_dataset_SDE_128.parquet")
-    
-    # On charge le dataset
+    # 1. Données
+    dataset_path = os.path.join(project_root, data_cfg.get("dataset_path", "data/storage/screened/super_dataset_SDE_128_causal.parquet"))
+    sig_depth = int(model_cfg.get("sig_depth", 3))
+    sig_time_augment = bool(model_cfg.get("sig_time_augment", True))
+    sig_lead_lag = bool(model_cfg.get("sig_lead_lag", False))
+
     full_dataset = ScreenedPairsDataset(
-        parquet_path=super_dataset_path,
-        max_adf_pvalue=0.15, # Ton seuil choisi !
-        sig_depth=model_cfg.get("sig_depth", 3)
+        parquet_path=dataset_path,
+        max_adf_pvalue=float(data_cfg.get("max_adf_pvalue", 0.15)),
+        max_hurst=float(data_cfg.get("max_hurst", 1.0)),
+        max_half_life=float(data_cfg.get("max_half_life", float("inf"))),
+        filter_on=data_cfg.get("filter_on", "target"),
+        sig_depth=sig_depth,
+        sig_time_augment=sig_time_augment,
+        sig_lead_lag=sig_lead_lag,
+        device="cuda" if device == "cuda" else "cpu",
     )
-    
-    # Train / Val Split (80% / 20%) strictement chronologique
-    train_size = int(0.8 * len(full_dataset))
-    val_size = len(full_dataset) - train_size
-    
-    train_dataset = torch.utils.data.Subset(full_dataset, range(0, train_size))
-    val_dataset = torch.utils.data.Subset(full_dataset, range(train_size, len(full_dataset)))
-    
-    # On passe num_workers=0 : le dataset tenant ENTIÈREMENT dans la RAM, 
-    # lancer des process Python parallèles ne fait que saturer les IPC (pickling).
-    train_dataloader = DataLoader(
-        train_dataset, batch_size=train_cfg.get("batch_size", 256), shuffle=True, drop_last=True, num_workers=0, pin_memory=(device == "cuda")
+
+    train_idx, val_idx = chronological_split(
+        full_dataset, float(data_cfg.get("train_frac", 0.8)), int(data_cfg.get("embargo_bars", full_dataset.seq_len))
     )
-    val_dataloader = DataLoader(
-        val_dataset, batch_size=train_cfg.get("batch_size", 256), shuffle=False, drop_last=True, num_workers=0, pin_memory=(device == "cuda")
-    )
-    
-    print(f"Datasets prêts : {train_size} Train | {val_size} Validation")
+    train_dataset = Subset(full_dataset, train_idx)
+    val_dataset = Subset(full_dataset, val_idx)
 
-    # --- CALIBRATION DYNAMIQUE DE LA VOLATILITÉ (Production-Safe) ---
-    print("🔍 Calibration automatique de la volatilité cible...")
-    # On récupère un seul gros batch du Dataloader d'entraînement
-    sample_batch = next(iter(train_dataloader))
-    
-    # Gestion de ta structure de tuple (real_paths, conditions, preputed)
-    if isinstance(sample_batch, (list, tuple)):
-        sample_paths = sample_batch[0]
-    else:
-        sample_paths = sample_batch
-        
-    # sample_paths est de dimension (Batch, Seq_Len, 2)
-    # Calcul du spread exact tel qu'il sera vu par la SDE : log_pA - log_pB
-    sample_spreads = sample_paths[:, :, 0] - sample_paths[:, :, 1]
-    
-    # Sécurité absolue : on évite un target_vol de 0.0 qui ferait exploser le log d'initialisation
-    min_vol = 1e-4
-    target_vols = []
-    for i, batch in enumerate(train_dataloader):
-        if i >= 5: break  # 5 batches suffisent
-        paths = batch[0] if isinstance(batch, (list, tuple)) else batch
-        spreads = paths[:, :, 0] - paths[:, :, 1]
-        target_vols.append(spreads.std().item())
-    target_vol = max(float(np.mean(target_vols)), min_vol)
+    batch_size = int(train_cfg.get("batch_size", 256))
+    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True,
+                                  num_workers=0, pin_memory=(device == "cuda"))
+    # Validation MÉLANGÉE (graine fixe) : le jeu est trié par date, des batches consécutifs ne couvrent qu'une période
+    # étroite, ce qui gonflait le MMD de validation d'un facteur ~6 (0,19 contre 0,03 mesuré) et faussait l'arrêt anticipé.
+    val_gen = torch.Generator().manual_seed(seed)
+    val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=True, drop_last=True, generator=val_gen,
+                                num_workers=0, pin_memory=(device == "cuda"))
+    print(f"Datasets prêts : {len(train_dataset)} Train | {len(val_dataset)} Validation (embargo {data_cfg.get('embargo_bars', full_dataset.seq_len)} barres)")
+    print(f"🧬 Dim. de conditionnement : {full_dataset.condition_dim} ({', '.join(full_dataset.condition_columns)} + spread initial)")
 
-    print(f"📊 Calibration SDE -> Volatilité cible: {target_vol:.5f} | Plancher: {min_vol:.5f}")
-
-    auto_condition_dim = getattr(full_dataset, "condition_dim", 10)
-    print(f"🧬 Dim. SDE générative dynamique : {auto_condition_dim} features.")
-
-    use_wandb = False
-    if os.getenv("WANDB_API_KEY"):
-        print("🌊 Initialisation de Weights & Biases...")
-        
-        run_name = f"neural_sde_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        
-        wandb.init(
-            project="pairs_trading",
-            name=run_name,
-            
-            # Tags pour filtrer facilement dans l'UI
-            tags=[
-                "neural_sde",
-                f"depth_{model_cfg.get('sig_depth', 3)}",
-                f"hidden_{model_cfg.get('hidden_dim', 128)}",
-                device,
-            ],
-            
-            # Notes libres (visible dans l'UI)
-            notes="Conditional Neural SDE + Kernel Signature MMD. Train sur crypto pairs screened.",
-            
-            # Config complète loggée (reproductibilité)
-            config={
-                **nn_config,  # ton yaml complet
-                # Infos runtime
-                "device":           device,
-                "target_vol":       target_vol,
-                "condition_dim":    auto_condition_dim,
-                "train_size":       train_size,
-                "val_size":         val_size,
-                "dataset_path":     super_dataset_path,
-                "torch_version":    torch.__version__,
-                "cuda_available":   torch.cuda.is_available(),
-                "gpu_name":         torch.cuda.get_device_name(0) if torch.cuda.is_available() else "N/A",
-            },
-        )
-        
-        # Définir les métriques summary (min/max dans le tableau de comparaison)
-        wandb.define_metric("val/mmd_loss",  summary="min")
-        wandb.define_metric("train/mmd_loss", summary="min")
-        wandb.define_metric("diagnostics/vol_ratio", summary="last")
-        
-        # Step metric : epoch comme axe X pour tous les graphs
-        wandb.define_metric("*", step_metric="epoch")
-        
-        use_wandb = True
-    else:
-        print("⚠️ W&B désactivé (pas de WANDB_API_KEY).")
-    
+    # 2. Modèle
     generator_sde = GeneratorSDE(
-        data_dim=model_cfg.get("data_dim", 2),
-        hidden_dim=model_cfg.get("hidden_dim", 128),
-        target_vol=target_vol,
-        min_vol=min_vol,
-        condition_dim=auto_condition_dim
+        data_dim=int(model_cfg.get("data_dim", 2)),
+        hidden_dim=int(model_cfg.get("hidden_dim", 128)),
+        min_vol=float(model_cfg.get("min_vol", 1e-4)),
+        condition_dim=full_dataset.condition_dim,
+        dt=float(model_cfg.get("dt_sde", 0.25)),
+        solver=model_cfg.get("sde_solver", "euler"),
+        latent_dim=int(model_cfg.get("latent_dim", 0)),
+        noise=model_cfg.get("noise", "gaussian"),
+        student_nu=float(model_cfg.get("student_nu", 6.0)),
+        mean_reversion=bool(model_cfg.get("mean_reversion", False)),
     ).to(device)
 
-    # Optimisation JIT: Les MLPs sont petits mais appelés 128x fois par le solveur SDE !
-    # Le "kernel launch overhead" détruit les perfs. On fuse les kernels via torch.compile.
-    if device == "cuda" and hasattr(torch, "compile"):
-        # print("⚡ Fusing Drift & Diffusion Kernels avec torch.compile...")
-        # On compile sélectivement les réseaux (fusion de couches) sans toucher à torchsde
-        # qui a du dynamic control flow.
-        # generator_sde.drift_net = torch.compile(generator_sde.drift_net)
-        # generator_sde.diffusion_net = torch.compile(generator_sde.diffusion_net)
-        print("⚡ Fusing Drift & Diffusion Kernels avec torch.compile... Desactivated")
+    # 3. Run / W&B
+    run_name = f"neural_sde_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    num_epochs = 2 if args.smoke else int(train_cfg.get("epochs", 500))
+    max_batches = 3 if args.smoke else train_cfg.get("max_batches_per_epoch")
 
-    # 6. Lancer l'entraînement (Neural SDE avec Signature MMD)
-    print("Démarrage de l'entraînement SDE... (Appuyez sur Ctrl+C pour arrêter, sauvegarder et détruire l'instance)")
-    
+    checkpoint_extras = {
+        "config": nn_config,
+        "scale_factor": full_dataset.scale_factor,
+        "global_std": full_dataset.global_std,
+        "scaler": {"mean": full_dataset.mean, "std": full_dataset.global_std},
+        "signature_scaler": {"mean": full_dataset.sig_mean, "std": full_dataset.sig_std},
+        "signature": {"depth": sig_depth, "time_augment": sig_time_augment, "lead_lag": sig_lead_lag},
+        "conditioning": full_dataset.conditioning_metadata(),
+        "dataset_path": os.path.relpath(dataset_path, project_root),
+        "dataset_sha256": _sha256(dataset_path),
+        "dataset_meta": full_dataset.dataset_meta,
+        "seed": seed,
+        "git_commit": _git_commit(),
+        "run_name": run_name,
+        "created": datetime.now().isoformat(timespec="seconds"),
+    }
+
+    use_wandb = False
+    if os.getenv("WANDB_API_KEY") and not args.smoke:
+        import wandb
+        print("🌊 Initialisation de Weights & Biases...")
+        wandb.init(
+            project="pairs_trading", name=run_name,
+            tags=["neural_sde", f"depth_{sig_depth}", f"hidden_{model_cfg.get('hidden_dim', 128)}", device, "causal"],
+            notes="Conditional Neural SDE + Kernel Signature MMD (canal temps). Conditionnement causal.",
+            config={**nn_config, "device": device, "condition_dim": full_dataset.condition_dim,
+                    "global_std": full_dataset.global_std, "train_size": len(train_dataset),
+                    "val_size": len(val_dataset), "dataset_path": dataset_path, "seed": seed,
+                    "torch_version": torch.__version__, "git_commit": checkpoint_extras["git_commit"]},
+        )
+        wandb.define_metric("val/mmd_loss", summary="min")
+        wandb.define_metric("train/mmd_loss", summary="min")
+        wandb.define_metric("*", step_metric="epoch")
+        use_wandb = True
+    else:
+        print("⚠️ W&B désactivé (pas de WANDB_API_KEY ou mode --smoke).")
+
+    model_dir = os.path.join(project_root, "data", "models")
+    os.makedirs(model_dir, exist_ok=True)
+
+    # 4. Entraînement
+    print("Démarrage de l'entraînement SDE... (Ctrl+C pour arrêter et sauvegarder)")
     try:
-        trained_model = train_sde(
+        trained_model, best_path, history = train_sde(
             generator_sde=generator_sde,
             train_loader=train_dataloader,
             val_loader=val_dataloader,
             sig_mean=full_dataset.sig_mean,
             sig_std=full_dataset.sig_std,
-            num_epochs=train_cfg.get("epochs", 500),
-            lr=train_cfg.get("learning_rate", 1e-4),
-            weight_decay=train_cfg.get("weight_decay", 0.01),
+            num_epochs=num_epochs,
+            lr=float(train_cfg.get("learning_rate", 1e-4)),
+            weight_decay=float(train_cfg.get("weight_decay", 0.01)),
             device=device,
-            sig_depth=model_cfg.get("sig_depth", 3),
-            use_wandb=use_wandb
+            sig_depth=sig_depth,
+            sig_time_augment=sig_time_augment,
+            sig_lead_lag=sig_lead_lag,
+            use_wandb=use_wandb,
+            seed=seed,
+            accum_iter=int(train_cfg.get("accum_iter", 4)),
+            ema_decay=float(train_cfg.get("ema_decay", 0.999)),
+            early_stop_patience=int(train_cfg.get("early_stop_patience", 70)),
+            val_every=int(train_cfg.get("val_every", 1)),
+            max_batches_per_epoch=max_batches,
+            save_dir=model_dir,
+            run_name=run_name,
+            checkpoint_extras=checkpoint_extras,
         )
     except KeyboardInterrupt:
-        print("\n🛑 Interruption détectée (Ctrl+C). Arrêt de l'entraînement...")
-        print("💾 L'état actuel de la SDE va être sauvegardé avant destruction...")
-        trained_model = generator_sde
-    
-    # 7. Sauvegarder le modèle
-    model_dir = os.path.join(project_root, "data", "models")
-    os.makedirs(model_dir, exist_ok=True)
-    
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_path = os.path.join(model_dir, f"neural_sde_{timestamp}_world_model.pt")
-    
-    # Sauvegarder les poids, la configuration et la standardisation (scaler)
-    torch.save({
-        "model_state_dict": trained_model.state_dict(),
-        "config": nn_config,
-        "scale_factor": full_dataset.scale_factor, # LA CLÉ POUR LA PRODUCTION
-        "global_std": full_dataset.global_std,     # Pour le debug
-        "scaler": {
-            "mean": full_dataset.mean,
-            "std":  full_dataset.global_std,
-        },
-        "signature_scaler": {
-            "mean": full_dataset.sig_mean,
-            "std":  full_dataset.sig_std,
-        },
-    }, save_path)   
-    
-    print(f"Modèle entraîné et sauvegardé avec succès dans : {save_path}")
+        print("\n🛑 Interruption (Ctrl+C) : sauvegarde de l'état courant...")
+        trained_model, best_path, history = generator_sde, None, []
 
-    # Terminer le run WandB propement
+    # 5. Sauvegarde finale (même format que le meilleur checkpoint)
+    save_path = os.path.join(model_dir, f"{run_name}_world_model.pt")
+    torch.save({"model_state_dict": trained_model.state_dict(), **checkpoint_extras,
+                "best_checkpoint": best_path, "history": history}, save_path)
+    print(f"Modèle sauvegardé : {save_path}" + (f" | meilleur : {best_path}" if best_path else ""))
+
     if use_wandb:
         wandb.finish()
+
 
 if __name__ == "__main__":
     main()
