@@ -1,0 +1,503 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[french]{babel}
+\usepackage{amsmath,amssymb,amsthm,mathtools,bm}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage[dvipsnames]{xcolor}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage[colorlinks=true,linkcolor=blue!60!black,citecolor=green!40!black]{hyperref}
+
+\newtheorem{proposition}{Proposition}
+\newtheorem{theoreme}{Théorème}
+\newtheorem{lemme}{Lemme}
+\theoremstyle{definition}
+\newtheorem{hyp}{Hypothèse}
+\theoremstyle{remark}
+\newtheorem{remarque}{Remarque}
+
+\newcommand{\E}{\mathbb{E}}
+\renewcommand{\P}{\mathbb{P}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\dd}{\mathrm{d}}
+\newcommand{\sinf}{\sigma_\infty}
+\DeclareMathOperator{\erfi}{erfi}
+\DeclareMathOperator{\Var}{Var}
+\DeclareMathOperator*{\argmax}{arg\,max}
+
+\title{Stratégie de retour à la moyenne sur un processus d'Ornstein--Uhlenbeck :\\
+hypothèses, critère ergodique et solutions explicites}
+\author{Notes de travail --- projet \texttt{pairs\_trading}}
+\date{10 novembre 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+On formalise la stratégie implémentée dans \texttt{research/institutional/}. Un processus scalaire $X$ (le spread)
+est supposé suivre un processus d'Ornstein--Uhlenbeck (OU). On considère la famille des politiques de bandes
+symétriques $(a,e)$, on évalue leur gain asymptotique par la théorie des processus de renouvellement avec
+récompense, et on le maximise. L'optimum est atteint par la politique de \emph{retournement} ($e=a$), pour laquelle
+le temps de cycle, le niveau optimal et le gain s'écrivent en fonction de $\erfi$ et d'une intégrale de Dawson.
+On explicite ensuite l'estimation des paramètres (biais de Kendall), la déformation introduite par le filtre de
+Kalman de couverture, la probabilité de succès par la fonction d'échelle, et un protocole de mesure de la
+mauvaise spécification. Chaque résultat est accompagné de son statut : démontré, vérifié numériquement, ou ouvert.
+\end{abstract}
+
+\tableofcontents
+
+% =============================================================================
+\section{Cadre et hypothèses}
+% =============================================================================
+
+Soient $(\Omega,\mathcal F,(\mathcal F_t),\P)$ un espace filtré supportant un mouvement brownien $W$, et
+$X=(X_t)_{t\ge 0}$ un processus réel adapté, appelé \emph{spread}. Le temps est mesuré en unités de barre
+(pas d'observation $\Delta=1$).
+
+\begin{hyp}[Dynamique OU]\label{h:ou}
+$X$ résout $\dd X_t=\theta(\mu-X_t)\,\dd t+\sigma\,\dd W_t$ avec $\theta>0$, $\mu\in\R$, $\sigma>0$ constants.
+\end{hyp}
+
+\begin{hyp}[Observation discrète]\label{h:disc}
+$X$ n'est observé qu'aux instants entiers, et les décisions sont prises sur ces observations.
+\end{hyp}
+
+\begin{hyp}[Gain linéaire]\label{h:pnl}
+Une position $q_t\in\{-1,0,+1\}$ portée sur $[t,t+1)$ rapporte $q_t\,(X_{t+1}-X_t)$ par unité de notional.
+\end{hyp}
+
+\begin{hyp}[Coût proportionnel]\label{h:cost}
+Chaque position (ouverture puis fermeture) coûte $c>0$ par unité de notional, indépendamment de sa durée.
+Un retournement $q:\pm1\to\mp1$ ferme une position et en ouvre une.
+\end{hyp}
+
+\begin{hyp}[Neutralité au risque]\label{h:rn}
+Le critère de choix est l'espérance du gain par unité de temps, sans pénalité de variance.
+\end{hyp}
+
+\begin{hyp}[Paramètres connus ou estimés par régression AR(1)]\label{h:est}
+Dans le moteur, $(\theta,\mu,\sigma)$ sont réestimés sur une fenêtre glissante de $N$ barres.
+\end{hyp}
+
+\begin{remarque}
+Les hypothèses \ref{h:ou}, \ref{h:est} et le choix du spread sont testés empiriquement en \S\ref{sec:miss} et
+\S\ref{sec:kalman}. L'hypothèse \ref{h:rn} est celle qui produit une politique investie en permanence (\S\ref{sec:opt}).
+\end{remarque}
+
+\subsection{Discrétisation exacte}
+
+\begin{proposition}\label{p:ar1}
+Sous \ref{h:ou}, avec $b=e^{-\theta}$,
+\[
+X_{t+1}=\mu+b\,(X_t-\mu)+\varepsilon_{t+1},\qquad
+\varepsilon_{t+1}\sim\mathcal N\!\Big(0,\ \tfrac{\sigma^2}{2\theta}(1-b^2)\Big)\ \text{i.i.d.},
+\]
+et la loi stationnaire est $\mathcal N(\mu,\sinf^2)$ avec $\sinf=\sigma/\sqrt{2\theta}$.
+\end{proposition}
+
+L'inversion utilisée pour calibrer est donc
+\begin{equation}\label{eq:inversion}
+\hat\theta=-\ln\hat b,\qquad \hat\mu=\frac{\hat a}{1-\hat b},\qquad
+\hat\sigma=\hat s_\varepsilon\sqrt{\frac{-2\ln\hat b}{1-\hat b^2}},
+\end{equation}
+où $(\hat a,\hat b)$ sont les coefficients de la régression $X_{t+1}=a+bX_t+\varepsilon$ et $\hat s_\varepsilon$
+l'écart-type des résidus.
+
+% =============================================================================
+\section{Réduction adimensionnée}
+% =============================================================================
+
+Posons $x=(X-\mu)/\sinf$ et $\tilde t=\theta t$. Alors $\tilde x$ résout
+\begin{equation}\label{eq:ou-std}
+\dd x_{\tilde t}=-x_{\tilde t}\,\dd\tilde t+\sqrt2\,\dd\tilde W_{\tilde t},
+\end{equation}
+d'espérance nulle et de variance stationnaire $1$. Tout résultat sur \eqref{eq:ou-std} se transporte au cas général
+par $a=\sinf\,\tilde a$, $e=\sinf\,\tilde e$, durée $=\tilde T/\theta$ en barres, et le coût devient
+\begin{equation}\label{eq:ctilde}
+\tilde c=\frac{c}{\sinf}=\frac{c\sqrt{2\theta}}{\sigma}.
+\end{equation}
+\textbf{Le seul paramètre sans dimension du problème est $\tilde c$.}
+
+\subsection{Générateur, fonction d'échelle, mesure de vitesse}
+
+Le générateur de \eqref{eq:ou-std} est $\mathcal L u=u''-y\,u'$. On pose
+\begin{equation}\label{eq:echelle}
+s'(y)=e^{y^2/2},\quad S(y)=\int_0^y e^{t^2/2}\,\dd t=\sqrt{\tfrac{\pi}{2}}\ \erfi\!\Big(\tfrac{y}{\sqrt2}\Big),\quad
+m(y)=e^{-y^2/2},
+\end{equation}
+de sorte que $\mathcal L u=s'\,(u'/s')'$. $S$ est strictement croissante, impaire, et $S(y)\sim e^{y^2/2}/y$ en $+\infty$.
+Les fonctions harmoniques ($\mathcal L u=0$) sont affines en $S$.
+
+\subsection{Temps de passage}
+
+Soit $\Phi$ la fonction de répartition de $\mathcal N(0,1)$ et $g(y)=e^{y^2/2}\Phi(y)$. On note $T_b$ le temps
+d'atteinte de $b$ et $\tau_{(\alpha,\beta)}$ le temps de sortie de $(\alpha,\beta)$.
+
+\begin{proposition}[Passage vers le haut]\label{p:fpt}
+Pour $x<b$,
+\[
+\E_x[T_b]=\sqrt{2\pi}\int_x^{b} g(y)\,\dd y .
+\]
+\end{proposition}
+\begin{proof}[Esquisse]
+$u(x)=\E_x[T_b]$ est la solution de $\mathcal L u=-1$, $u(b)=0$, de croissance sous-exponentielle en $-\infty$.
+Avec $\mathcal L u=s'(u'/s')'$ on a $(u'/s')'=-e^{-y^2/2}$, d'où $u'(y)/s'(y)=-\int_{-\infty}^{y}e^{-z^2/2}\dd z=-\sqrt{2\pi}\,\Phi(y)$
+(la constante est fixée par la condition de croissance). Donc $u'(y)=-\sqrt{2\pi}\,e^{y^2/2}\Phi(y)$ et l'on intègre de $x$ à $b$.
+\end{proof}
+
+\begin{proposition}[Sortie d'un intervalle]\label{p:exit}
+Pour $-\alpha<x<\beta$, avec $D=S(\beta)-S(-\alpha)$,
+\[
+\E_x[\tau_{(-\alpha,\beta)}]=\frac{S(\beta)-S(x)}{D}\int_{-\alpha}^{x}\!\big(S(z)-S(-\alpha)\big)m(z)\,\dd z
++\frac{S(x)-S(-\alpha)}{D}\int_{x}^{\beta}\!\big(S(\beta)-S(z)\big)m(z)\,\dd z .
+\]
+\end{proposition}
+(Fonction de Green de $\mathcal L$ avec conditions de Dirichlet; voir Borodin--Salminen, \emph{Handbook of Brownian
+Motion}.) Les propositions \ref{p:fpt} et \ref{p:exit} ont été vérifiées contre une résolution de l'EDO par
+différences finies (erreur $<10^{-3}$ sur six cas) et par simulation de Monte-Carlo.
+
+\begin{proposition}[Probabilité de sortie par un bord]\label{p:hit}
+Pour $-\alpha<x<\beta$,
+\[
+\P_x\big(T_\beta<T_{-\alpha}\big)=\frac{S(x)-S(-\alpha)}{S(\beta)-S(-\alpha)}.
+\]
+\end{proposition}
+\begin{proof}
+$h(x)=\P_x(T_\beta<T_{-\alpha})$ vérifie $\mathcal Lh=0$, $h(-\alpha)=0$, $h(\beta)=1$; les solutions sont affines en $S$.
+\end{proof}
+
+% =============================================================================
+\section{Critère ergodique et optimum}\label{sec:opt}
+% =============================================================================
+
+\subsection{Famille de politiques}
+
+Pour $a>0$ et $e\in(-a,a]$, la politique $\pi_{a,e}$ de \eqref{eq:ou-std} est :
+\begin{itemize}[nosep]
+\item à plat, on prend une position \emph{longue} dès que $x\le -a$ et \emph{courte} dès que $x\ge a$ ;
+\item une position longue est fermée quand $x\ge e$, une position courte quand $x\le -e$ ;
+\item si $e=a$, la fermeture d'une position longue en $x=a$ coïncide avec l'ouverture d'une position courte :
+c'est le \emph{retournement}, la politique n'est jamais à plat.
+\end{itemize}
+
+\subsection{Gain asymptotique par renouvellement}
+
+Par symétrie $x\mapsto -x$, les positions longues et courtes sont équivalentes en loi. Une position longue
+entrée en $-a$ et fermée en $e$ rapporte exactement
+\begin{equation}\label{eq:profit}
+\pi(a,e)=a+e-\tilde c \quad(\text{en unités de }\sinf),
+\end{equation}
+car $x$ est continu et ne franchit pas de niveau sans l'atteindre. La durée d'un cycle (position + éventuelle attente à plat) est
+\begin{equation}\label{eq:cycle}
+T(a,e)=\E_{-a}[T_e]+\E_e\big[\tau_{(-a,a)}\big],
+\end{equation}
+avec la convention que le second terme est nul si $e=a$.
+
+\begin{theoreme}[Renouvellement avec récompense]\label{t:renew}
+Les cycles successifs sont i.i.d.\ en loi à une symétrie près et $\E[T]<\infty$. Presque sûrement,
+\[
+\lim_{H\to\infty}\frac{1}{H}\,(\text{gain cumulé sur }[0,H])=R(a,e):=\frac{a+e-\tilde c}{T(a,e)} .
+\]
+\end{theoreme}
+Il s'agit de la loi des grands nombres pour les processus de renouvellement avec récompense. Le taux
+en unités de la barre est $\theta\,\sinf\,R(a,e)$, et les niveaux sont $\mu\pm\sinf\,a$, $\mu\pm\sinf\,e$.
+
+\subsection{Le retournement : forme fermée}
+
+\begin{proposition}\label{p:flip}
+Pour la politique de retournement ($e=a$),
+\[
+T(a,a)=\E_{-a}[T_a]=\sqrt{2\pi}\,S(a)=\pi\,\erfi\!\Big(\tfrac{a}{\sqrt2}\Big).
+\]
+\end{proposition}
+\begin{proof}
+Par la proposition \ref{p:fpt}, $T(a,a)=\sqrt{2\pi}\int_{-a}^{a}g$. Or $g(y)+g(-y)=e^{y^2/2}(\Phi(y)+\Phi(-y))=e^{y^2/2}$, donc
+$\int_{-a}^{a}g=\int_0^a (g(y)+g(-y))\,\dd y=S(a)$.
+\end{proof}
+
+Le gain asymptotique du retournement est donc $R(a)=\dfrac{2a-\tilde c}{\pi\erfi(a/\sqrt2)}$.
+
+\begin{proposition}[Niveau optimal du retournement]\label{p:opt}
+Pour tout $\tilde c>0$, $a\mapsto R(a)$ admet un unique maximiseur $a^*(\tilde c)$ sur $(\tilde c/2,\infty)$, caractérisé par
+\begin{equation}\label{eq:foc}
+\tilde c=\psi(a^*),\qquad \psi(a):=2\Big[a-e^{-a^2/2}S(a)\Big]=2\Big[a-\int_0^a e^{(y^2-a^2)/2}\dd y\Big].
+\end{equation}
+L'application $\psi$ est une bijection croissante de $(0,\infty)$ sur lui-même, et
+$a^*(\tilde c)=\big(\tfrac32\tilde c\big)^{1/3}\,(1+o(1))$ quand $\tilde c\to0$.
+\end{proposition}
+\begin{proof}
+Posons $T(a)=\pi\erfi(a/\sqrt2)$, de sorte que $T'(a)=\sqrt{2\pi}\,e^{a^2/2}$ et $T''>0$.
+Alors $R'(a)=h(a)/T(a)^2$ avec $h(a)=2T(a)-(2a-\tilde c)\,T'(a)$. On calcule
+$h'(a)=-(2a-\tilde c)\,T''(a)<0$ pour $2a>\tilde c$, $h(\tilde c/2)=2T(\tilde c/2)>0$ et $h(a)\to-\infty$
+(car $T'/T\to\infty$ à l'infini). Donc $h$ s'annule une seule fois, $R$ croît puis décroît.
+L'équation $h(a)=0$ s'écrit $2\sqrt{2\pi}\,S(a)=(2a-\tilde c)\sqrt{2\pi}\,e^{a^2/2}$, soit \eqref{eq:foc}.
+Enfin $\psi'(a)=2a\,e^{-a^2/2}S(a)>0$, $\psi(0)=0$, et le développement
+$e^{-a^2/2}S(a)=a-a^3/3+O(a^5)$ donne $\psi(a)=\tfrac23a^3+O(a^5)$.
+\end{proof}
+
+En unités dimensionnelles, pour $\tilde c\ll1$ :
+\begin{equation}\label{eq:scaling}
+a^*\simeq\Big(\frac{3c}{2}\Big)^{1/3}\sigma^{2/3}(2\theta)^{-1/3}\propto c^{1/3}\,\sigma^{2/3}\,\theta^{-1/3},
+\end{equation}
+la loi d'échelle de Bertram : la bande croît avec le coût et la volatilité, décroît avec la vitesse de rappel.
+
+\begin{table}[h]
+\centering
+\caption{Retournement optimal (forme fermée, vérifiée contre l'optimisation numérique sur $(a,e)$).}
+\begin{tabular}{rrrrr}
+\toprule
+$\tilde c$ & $a^*$ & $(3\tilde c/2)^{1/3}$ & $T(a^*)$ & $R(a^*)$\\
+\midrule
+0{,}02 & 0{,}313 & 0{,}311 & 0{,}797 & 0{,}760\\
+0{,}10 & 0{,}542 & 0{,}531 & 1{,}427 & 0{,}689\\
+0{,}30 & 0{,}799 & 0{,}766 & 2{,}237 & 0{,}580\\
+1{,}00 & 1{,}264 & 1{,}145 & 4{,}262 & 0{,}359\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Optimisation sur $(a,e)$ : statut}
+
+Le taux $R(a,e)$ des équations \eqref{eq:profit}--\eqref{eq:cycle} a été calculé sur une grille
+(pas $0{,}01$ en $a$ et $e$, $a\le6$) à l'aide des propositions \ref{p:fpt} et \ref{p:exit} par cumuls trapézoïdaux.
+
+\begin{remarque}[Résultat numérique, non démontré]
+Pour les six valeurs $\tilde c\in\{0{,}02;\,0{,}1;\,0{,}3;\,0{,}6;\,1;\,1{,}5\}$, le maximum sur $(a,e)$ est atteint en $e=a$.
+La politique « sortie à la moyenne » ($e=0$) atteint $97\,\%$, $91\,\%$, $81\,\%$, $67\,\%$, $51\,\%$, $33\,\%$ du taux optimal.
+Une preuve de $\arg\max_e R(a,e)=a$ pour tout $a$ reste ouverte.
+\end{remarque}
+
+La théorie a été confrontée à une simulation directe de la politique sur un OU exact (pas $0{,}005$, $6\cdot10^6$ pas) :
+$R_{\mathrm{th}}=0{,}689$ contre $0{,}694$ pour $\tilde c=0{,}1$, et $0{,}468$ contre $0{,}465$ pour $\tilde c=0{,}6$.
+
+% =============================================================================
+\section{Critère actualisé (Leung--Li)}
+% =============================================================================
+
+Pour un taux $r>0$, le problème d'arrêt optimal de Leung et Li (2015) pour un OU avec coût $c$ se résout en deux étapes.
+
+\paragraph{Sortie d'une position longue.} On cherche $V(x)=\sup_{\tau}\E_x\big[e^{-r\tau}(X_\tau-c)\big]$.
+Soient $F$ et $G$ les solutions croissante et décroissante de $\tfrac{\sigma^2}{2}f''+\theta(\mu-x)f'-rf=0$ ; en termes de la
+fonction cylindre parabolique $D_\nu$ de Weber, avec $z=(x-\mu)\sqrt{2\theta}/\sigma$ et $\nu=-r/\theta$,
+\[
+F(x)=e^{z^2/4}D_{\nu}(-z),\qquad G(x)=e^{z^2/4}D_{\nu}(z).
+\]
+Alors $V(x)=(b^*-c)\,F(x)/F(b^*)$ sur $x<b^*$, où $b^*=\argmax_b\,(b-c)/F(b)$.
+
+\paragraph{Entrée.} $J(x)=\sup_{\nu}\E_x\big[e^{-r\nu}(V(X_\nu)-X_\nu-c)\big]$ s'écrit $J(x)=\big(V(d^*)-d^*-c\big)\,G(x)/G(d^*)$ pour $x>d^*$, avec
+$d^*=\argmax_d\,\big(V(d)-d-c\big)/G(d)$.
+
+\begin{remarque}[Dégénérescence]
+Les résidus de l'EDO pour $F,G$ ont été vérifiés ($<4\cdot10^{-7}$ en relatif). Pour $\theta=0{,}1$, $\sigma=0{,}01$, $c=10^{-3}$ :
+$r/\theta=10^{-1},\,10^{-2},\,10^{-3},\,5{,}7\cdot10^{-5}$ donnent des niveaux d'entrée de $1{,}36,\,2{,}20,\,2{,}94,\,3{,}72$ écarts-types.
+Pour un taux annuel de $5\,\%$ converti par barre horaire, $r/\theta\sim10^{-4}$ et les niveaux partent vers la borne : « attendre est gratuit ».
+Les niveaux $b^*,d^*$ sont des niveaux absolus de $X$ et le problème n'est pas invariant par translation quand $r>0$ (le gain $X_\tau-c$ est un capital détenu).
+Le critère actualisé n'est donc pas adapté à l'horizon intra-journalier avec un taux réaliste. C'est la raison pour laquelle le critère ergodique de la \S\ref{sec:opt}
+est le critère par défaut.
+\end{remarque}
+
+% =============================================================================
+\section{Estimation des paramètres}
+% =============================================================================
+
+\subsection{Biais de Kendall}
+
+\begin{proposition}[Kendall, 1954]
+Pour une régression AR(1) avec constante estimée sur $N$ observations,
+$\E[\hat b]=b-\dfrac{1+3b}{N}+O(N^{-2})$.
+\end{proposition}
+
+Pour $\theta=0{,}02$ ($b=0{,}980$) et $N=156$ : $b-(1+3b)/N=0{,}955$, d'où $\hat\theta\approx0{,}046$,
+contre une médiane de $0{,}047$ mesurée sur $4000$ simulations. Le biais va dans le sens d'un rappel \emph{plus rapide}
+que le vrai. Comme $\tilde c=c\sqrt{2\theta}/\sigma$ dépend de $\hat\theta$ et $\hat\sigma$ (équation \eqref{eq:inversion}) et que les niveaux sont
+$a^*(\tilde c)\,\sigma/\sqrt{2\theta}$, l'effet net sur les seuils n'est pas dérivé ici ; il est mesuré indirectement en \S\ref{sec:miss} (écart moteur--oracle).
+
+\subsection{Incertitude de $\hat\theta$}
+
+L'erreur-type asymptotique de $\hat b$ est $\sqrt{(1-b^2)/N}$. Pour $\theta\approx0{,}04$, $N=156$ elle vaut environ $0{,}023$ sur $\theta$ :
+la dispersion de $\hat\theta$ d'une fenêtre à l'autre contient donc une part de bruit d'échantillonnage du même ordre que la dispersion observée
+(rapport des déciles $9\times$ sur ADA/AVAX).
+
+% =============================================================================
+\section{Couche de couverture par filtre de Kalman}\label{sec:kalman}
+% =============================================================================
+
+Le spread négocié n'est pas $X$ mais une \emph{innovation} de filtre. Avec $y_t=\log P^A_t$, $h_t=(\log P^B_t,\,1)^\top$ et un état
+$\vartheta_t=(\beta_t,\alpha_t)^\top$ évoluant en marche aléatoire de covariance $Q$, le filtre calcule
+\[
+e_t=y_t-h_t^\top\hat\vartheta_{t|t-1},\qquad S_t=h_t^\top P_{t|t-1}h_t+R,\qquad
+\hat\vartheta_{t|t}=\hat\vartheta_{t|t-1}+K_t e_t .
+\]
+
+\begin{proposition}[Effet passe-haut, approximation scalaire]
+Si $\alpha$ est estimé avec un gain constant $K\in(0,1)$ et si $\beta$ est supposé exact, alors $e_t=X_t-m_{t-1}$ avec
+$m_t=(1-K)m_{t-1}+KX_t$, c'est-à-dire
+\[
+e=\frac{1-L}{1-(1-K)L}\,X ,
+\]
+où $L$ est l'opérateur retard. La fonction de transfert s'annule en fréquence nulle : les composantes lentes de $X$ sont supprimées.
+\end{proposition}
+\begin{proof}
+$m_{t-1}=K\sum_{j\ge0}(1-K)^jX_{t-1-j}$, d'où $e=X-\frac{KL}{1-(1-K)L}X=\frac{1-(1-K)L-KL}{1-(1-K)L}X$.
+\end{proof}
+
+Conséquence : l'autocorrélation d'ordre 1 de l'innovation est inférieure à celle de $X$. Pour $X$ AR(1) de coefficient $\varphi=0{,}9$ :
+
+\begin{center}
+\begin{tabular}{lcccc}
+\toprule
+$K$ & $0$ & $0{,}05$ & $0{,}10$ & $0{,}20$\\
+$\rho_e(1)$ & $0{,}900$ & $0{,}851$ & $0{,}804$ & $0{,}708$\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Sur une paire simulée avec $\varphi=0{,}9$ le code mesure $\hat\varphi_e=0{,}736$, ce qui correspond à $K_{\mathrm{eq}}\approx0{,}17$ dans ce modèle
+(approximation : l'estimation conjointe de $\beta$ n'est pas prise en compte).
+
+\paragraph{Pourquoi c'est un problème d'estimation et de décision.} Les seuils \eqref{eq:foc} sont calculés avec les paramètres de $e$ (donc $\hat\theta_e>\theta$, $\hat\sigma_e<\sigma$)
+alors que le gain réalisé est $\Delta X$ (hypothèse \ref{h:pnl}) : le signal est calculé sur une série dont la dynamique n'est pas celle qu'on encaisse.
+
+% =============================================================================
+\section{Dimensionnement : probabilité de succès et critère de Kelly}
+% =============================================================================
+
+Dans \eqref{eq:ou-std} un trade gagne \emph{exactement} $a+e-\tilde c$ : il n'y a pas de perte intrinsèque.
+On introduit une perte adverse hypothétique : le trade est abandonné si $x$ atteint $-(a+s)$, $s>0$ (en unités de $\sinf$), avec perte $s+\tilde c$.
+
+\begin{proposition}
+Par la proposition \ref{p:hit}, la probabilité de succès est
+\[
+p(a,e,s)=\frac{S(-a)-S(-a-s)}{S(e)-S(-a-s)} .
+\]
+\end{proposition}
+Vérifiée par Monte-Carlo (écart $<0{,}03$ avec $4000$ trajectoires). Avec $w=a+e-\tilde c$, $\ell=s+\tilde c$, $\beta=w/\ell$, la fraction de Kelly est
+\[
+f^*=\frac{p\,\beta-(1-p)}{\beta},\qquad f=\min\big(\lambda f^*_+,\ f_{\max}\big),\quad \lambda\in(0,1].
+\]
+\begin{remarque}
+$f^*$ dépend fortement de $s$, qui est une hypothèse de risque et non un résultat du modèle : sur une paire simulée,
+$\lambda f^*=0{,}04;\ 0{,}20;\ 0{,}25$ pour $s=1;\ 2;\ 3$ écarts-types ($\lambda=0{,}25$).
+\end{remarque}
+
+% =============================================================================
+\section{Mauvaise spécification : protocole et premiers résultats}\label{sec:miss}
+% =============================================================================
+
+\subsection{Processus générateurs}
+
+Les écarts à \ref{h:ou} sont introduits un par un puis ensemble, avec $x_{t+1}=\mu_{t+1}+b_{t+1}(x_t-\mu_t)+\sigma_{t+1}\xi_{t+1}+J_{t+1}$ et $b_t=e^{-\theta_t}$ :
+\begin{itemize}[nosep]
+\item queues : $\xi$ de loi de Student à $\nu$ degrés de liberté, normalisée en variance $1$ ;
+\item volatilité stochastique : $\ln\sigma_t=\ln\sigma_0+h_t-\tfrac12\Var h$, $h_{t+1}=\rho h_t+\eta\,\zeta_{t+1}$ ;
+\item sauts : $J_t=\mathbf 1_{\{U_t<p_J\}}\,\kappa\,\sigma_0\,\zeta'_t$ ;
+\item niveau moyen dérivant : $\mu_{t+1}=\mu_t+\delta\,\sigma_0\,\zeta''_{t+1}$ ;
+\item régimes : $\theta_t\in\{\theta_{\mathrm{h}},\theta_{\mathrm{b}}\}$, chaîne de Markov à deux états.
+\end{itemize}
+La calibration vise les statistiques mesurées sur le spread réel ADA/AVAX :
+
+\begin{center}
+\begin{tabular}{lrr}
+\toprule
+ & réel & scénario combiné\\
+\midrule
+$\hat\theta$ médian ($N=156$) & $0{,}037$ & $0{,}050$\\
+rapport des déciles de $\hat\theta$ & $9{,}0$ & $7{,}2$\\
+kurtosis excédentaire des résidus (médiane) & $2{,}6$ & $3{,}9$\\
+autocorrélation de $\hat\varepsilon^2$ (médiane) & $0{,}10$ & $0{,}09$\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Références de comparaison}
+
+\begin{itemize}[nosep]
+\item \textbf{Moteur} : calibration AR(1) glissante \eqref{eq:inversion}, bandes optimales $\pm a^*\sinf$.
+\item \textbf{Oracle} : mêmes bandes avec les paramètres \emph{vrais} $(\theta_t,\mu_t,\sigma_t)$ à chaque barre ; mesure le coût de l'estimation et de la dérive.
+\item \textbf{Échelle $k$} : bandes multipliées par $k$ ; si $\arg\max_k=1$ la forme OU des seuils est adaptée.
+\end{itemize}
+
+\subsection{Deux défauts de l'implémentation, isolés par ce protocole}
+
+Les premiers essais montraient un moteur perdant même avec les \emph{vrais} paramètres. L'expérience contrôlée a isolé deux causes, toutes deux étrangères à la forme OU :
+
+\begin{enumerate}[nosep]
+\item \textbf{Référence des seuils.} Les niveaux $\mu\pm a\sinf$ étaient placés autour d'une moyenne exponentielle rapide $m_t$ du spread, et non autour du $\mu$ de la calibration. Le signal effectif était
+$x_t-m_t$, c'est-à-dire de nouveau un filtre passe-haut (même mécanisme que la proposition ci-dessus), avec les gains correspondants :
+à paramètres vrais et sans couche de Kalman, rendement $84\,\%$ (seuils sur $m_t$) contre $337\,\%$ (seuils sur $\mu$ calibré), la théorie prédisant $335\,\%$
+($147\,\%$ additifs capitalisés sur $3400$ barres, $\tilde c=0{,}066$). Avec $\mu$ calibré, le facteur d'échelle optimal des bandes est $k^*\approx1$ (plat entre $0{,}7$ et $1$), ce qui lève l'écart noté plus haut.
+\item \textbf{Couche de couverture.} L'innovation de Kalman est remplacée par $x_t=\log P^A_t-\hat\beta\log P^B_t-\hat\alpha$ où $(\hat\beta,\hat\alpha)$ est la régression par moindres carrés avec constante sur les $500$ barres
+strictement passées, rafraîchie toutes les $24$ barres. L'autocorrélation d'ordre 1 du spread est préservée ($\hat\varphi=0{,}979$ pour $0{,}980$) au lieu de $0{,}72$.
+La constante évite un saut de niveau $\Delta\beta\,\log P^B$ aux rafraîchissements.
+\end{enumerate}
+
+Deux réglages ont de plus été mesurés. \emph{Fenêtre de calibration} $N$ : sur un OU pur (arrêt temporel $2\times$ demi-vie) le rendement moyen passe de $197\,\%$ ($N=156$) à $435\,\%$ ($N=312$) puis $487\,\%$ ($N=624$), l'oracle étant à $636\,\%$ ;
+l'ordre est le même avec dérive du niveau moyen et dans le scénario combiné. Justification : pour $\theta=0{,}02$, une fenêtre de $156$ barres contient environ $N\theta/2\approx1{,}6$ échantillons indépendants, l'écart-type de $\hat\mu$ est de l'ordre de $\sinf$ alors que la demi-largeur de bande optimale vaut $a^*\sinf\approx0{,}47\sinf$.
+\emph{Arrêt temporel} : $2$, $4$, $8$ demi-vies ou aucun donnent $345$, $364$, $381$, $386\,\%$ sur OU pur, et $109$, $117$, $119$, $119\,\%$ avec une rupture de cointégration à $60\,\%$ de la série (pire drawdown identique, $-38\,\%$) ; défaut retenu : $8$ demi-vies.
+
+\subsection{Résultats avec les réglages corrigés}
+
+Rendement total moyen en \% sur $16$ trajectoires de $6000$ barres ($\beta=1{,}5$ inconnu du moteur, position $=100\,\%$ du capital, $c=20$ pb).
+« Historique » : couverture de Kalman, seuils sur la moyenne rapide, $N=156$, arrêt à $2$ demi-vies. « Nouveau » : couverture OLS roulante, $\mu$ calibré, $N=624$, arrêt à $8$ demi-vies.
+« Oracle » : $\beta$ et $(\theta_t,\mu_t,\sigma_t)$ vrais à chaque barre.
+
+\begin{center}
+\small
+\begin{tabular}{lrrrrrr}
+\toprule
+scénario & historique & nouveau & $k=0{,}7$ & $k=1{,}5$ & oracle & nouveau/oracle\\
+\midrule
+OU pur & $-64$ & $381$ & $384$ & $379$ & $715$ & $53\,\%$\\
++ queues de Student & $-48$ & $391$ & $389$ & $376$ & $701$ & $56\,\%$\\
++ volatilité stochastique & $-54$ & $345$ & $336$ & $359$ & $1176$ & $29\,\%$\\
++ sauts & $-66$ & $487$ & $436$ & $445$ & $939$ & $52\,\%$\\
++ niveau moyen dérivant & $-63$ & $401$ & $359$ & $365$ & $672$ & $60\,\%$\\
++ régimes de $\theta$ & $-60$ & $316$ & $353$ & $276$ & $865$ & $36\,\%$\\
+rupture de cointégration & $-66$ & $119$ & $124$ & $144$ & $179$ & $66\,\%$\\
+tout combiné & $-42$ & $464$ & $419$ & $480$ & $1636$ & $28\,\%$\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{Lecture.}
+\begin{enumerate}[nosep]
+\item La configuration historique perd dans tous les scénarios, y compris l'OU pur ; la nouvelle gagne dans tous (en moyenne), sur $88$ à $100\,\%$ des trajectoires.
+\item Les seuils théoriques ($k=1$) ne sont pas nettement battus par $k=0{,}7$ ou $k=1{,}5$ : les différences ne sont pas systématiques d'un scénario à l'autre (aucune erreur-type n'a été calculée ici ; avec $16$ trajectoires de rendement très dispersé, elles ne sont pas établies).
+\item Le coût résiduel de l'estimation est important : le moteur capte $28$ à $66\,\%$ de l'oracle. Il est le plus fort là où les paramètres varient vite ($\sigma_t$ stochastique, régimes de $\theta$, scénario combiné : $28$ à $36\,\%$),
+ce qui est cohérent avec le compromis d'une longue fenêtre (précision) contre sa lenteur d'adaptation. Une estimation adaptative est donc la piste suivante.
+\item L'oracle de la volatilité stochastique connaît $\sigma_t$ à chaque barre : il est plus favorable que ce qu'un estimateur causal peut atteindre ; le rapport $29\,\%$ est un minorant du rapport atteignable.
+\end{enumerate}
+
+% =============================================================================
+\section{Récapitulatif : ce qui est établi et ce qui est ouvert}
+% =============================================================================
+
+\begin{center}
+\begin{tabular}{p{0.52\textwidth}p{0.38\textwidth}}
+\toprule
+Énoncé & Statut\\
+\midrule
+Discrétisation exacte, inversion \eqref{eq:inversion} & démontré\\
+Temps de passage, probabilité de sortie (prop.\ \ref{p:fpt}--\ref{p:hit}) & démontré (esquisse) + vérifié numériquement\\
+Gain asymptotique par renouvellement (th.\ \ref{t:renew}) & résultat classique\\
+Cycle du retournement $=\pi\erfi(a/\sqrt2)$, optimum unique \eqref{eq:foc} & démontré\\
+Optimalité de $e=a$ sur la famille $(a,e)$ & vérifié sur grille, preuve ouverte\\
+Biais de Kendall sur $\hat\theta$ & résultat classique, vérifié par simulation\\
+Effet passe-haut de l'innovation de Kalman & démontré (approximation scalaire), effet mesuré\\
+Origine de $k^*\neq1$ à paramètres connus & expliqué : seuils ancrés sur une moyenne rapide ; $k^*\approx1$ après correction\\
+Estimation adaptative de $(\theta,\sigma,\mu)$ (volatilité stochastique, régimes) & \textbf{ouvert}\\
+Politique optimale hors OU (queues, volatilité stochastique, régimes) & \textbf{ouvert}\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{thebibliography}{9}
+\bibitem{bertram} W.\ K.\ Bertram, \emph{Analytic solutions for optimal statistical arbitrage trading}, Physica A 389 (2010) 2234--2243.
+\bibitem{leungli} T.\ Leung, X.\ Li, \emph{Optimal mean reversion trading with transaction costs and stop-loss exit}, Int.\ J.\ Theor.\ Appl.\ Finance 18 (2015).
+\bibitem{kendall} M.\ G.\ Kendall, \emph{Note on bias in the estimation of autocorrelation}, Biometrika 41 (1954) 403--404.
+\bibitem{borodin} A.\ N.\ Borodin, P.\ Salminen, \emph{Handbook of Brownian Motion --- Facts and Formulae}, Birkhäuser, 2002.
+\bibitem{kelly} J.\ L.\ Kelly, \emph{A new interpretation of information rate}, Bell Syst.\ Tech.\ J.\ 35 (1956).
+\end{thebibliography}
+
+\end{document}

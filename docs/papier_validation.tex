@@ -1,0 +1,296 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[french]{babel}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage[dvipsnames]{xcolor}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage[colorlinks=true,linkcolor=blue!60!black,citecolor=green!40!black]{hyperref}
+
+\newtheorem{proposition}{Proposition}
+\theoremstyle{remark}
+\newtheorem{remarque}{Remarque}
+
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\dd}{\mathrm{d}}
+\newcommand{\sinf}{\sigma_\infty}
+\DeclareMathOperator{\erfi}{erfi}
+% Repère rouge : passage à compléter avant diffusion
+\newcommand{\acompleter}[1]{\textcolor{red}{\textbf{[À COMPLÉTER : #1]}}}
+
+\title{Du signal apparent au gain encaissable :\\
+trois mécanismes de faux signal dans une stratégie de retour à la moyenne\\
+sur paires de cryptomonnaies}
+\author{Notes de travail --- version brouillon}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+On étudie une stratégie de retour à la moyenne sur $153$ paires de cryptomonnaies (barres horaires, 2022--2023) dont les seuils
+dérivent d'un critère ergodique sur un processus d'Ornstein--Uhlenbeck. Sur données simulées conformes au modèle, la théorie est
+retrouvée (rendement mesuré $337\,\%$ pour $335\,\%$ prédit). Sur données réelles, le rendement brut est négatif quelles que soient la règle
+de sortie, l'échelle des bandes, la barrière de stationnarité ou la calibration d'un stop. Nous isolons trois mécanismes qui font paraître
+le signal prédictif sans qu'il soit encaissable : le recalcul du spread à chaque rafraîchissement de la couverture, l'usage de l'innovation d'un filtre
+de Kalman comme spread, et l'ancrage des seuils sur une moyenne exponentielle rapide. Chacun est démontré ou mesuré en simulation, puis
+observé sur données réelles. Le résultat principal est donc méthodologique : un signal peut être cohérent avec la théorie et pourtant sans valeur,
+et la distinction se fait par la mesure du gain à couverture figée.
+\end{abstract}
+
+% =============================================================================
+\section{Question et résultats}
+% =============================================================================
+
+\textbf{Question.} Un spread dont les paramètres sont calibrés sur une fenêtre glissante fournit-il un avantage hors échantillon ?
+
+\textbf{Résultats.}
+\begin{enumerate}[nosep]
+\item Sur simulation d'un OU, le moteur retrouve la théorie (\S\ref{sec:sim}).
+\item Sur données réelles, le rendement brut du portefeuille est négatif ; le retour à la moyenne existe (pente positive pour $95$ à $99\,\%$ des paires)
+mais vaut environ $0{,}3$ fois ce que prédit la calibration (\S\ref{sec:reel}).
+\item Trois mécanismes créent une apparence de signal non encaissable (\S\ref{sec:meca}).
+\end{enumerate}
+
+% =============================================================================
+\section{Cadre}\label{sec:cadre}
+% =============================================================================
+
+Le spread $X_t=\log P^A_t-\beta\log P^B_t-\alpha$ est supposé suivre $\dd X=\theta(\mu-X)\dd t+\sigma\dd W$, avec $\sinf=\sigma/\sqrt{2\theta}$.
+Après adimensionnement, le seul paramètre du problème est $\tilde c=c/\sinf$ ($c$ : coût d'un aller-retour). Pour la famille de politiques de bandes
+symétriques $(a,e)$ le gain asymptotique est $R(a,e)=(a+e-\tilde c)/T(a,e)$ (théorème de renouvellement avec récompense) ; l'optimum observé est le
+\emph{retournement} ($e=a$), pour lequel
+\[
+T(a)=\pi\,\erfi\!\big(a/\sqrt2\big),\qquad
+\tilde c=2\Big[a^*-e^{-a^{*2}/2}\!\int_0^{a^*}\!e^{t^2/2}\dd t\Big],\qquad a^*\simeq\big(\tfrac32\tilde c\big)^{1/3}.
+\]
+Les démonstrations (cycle fermé, unicité de $a^*$, biais de Kendall) figurent dans le document compagnon \texttt{strategie\_hypotheses.pdf}.
+
+% =============================================================================
+\section{Protocole}\label{sec:proto}
+% =============================================================================
+
+\textbf{Données.} Barres horaires de $153$ paires issues d'un regroupement des corrélations de rendements (du 21 janvier 2022 au 31 décembre 2023, soit $17\,039$ barres).
+
+\textbf{Moteur.} À la barre $i$, couverture, calibration $(\theta,\mu,\sigma)$ par AR(1), seuils et signaux n'utilisent que les barres $\le i$ : le test est causal.
+Réglages par défaut (choisis sur simulation, non sur ces données) : couverture par moindres carrés avec constante sur les $500$ barres passées rafraîchie toutes les $24$ barres,
+fenêtre de calibration $624$ barres, $\mu$ calibré, arrêt temporel à $8$ demi-vies.
+
+\textbf{Gain.} Calculé sur les prix : $\sum q_{t-1}(r^A_t-\hat\beta_{t-1}r^B_t)$ (rendements simples), coût de $5$ pb par jambe ($20$ pb par aller-retour), $10\,\%$ du capital par jambe,
+une tranche de capital par paire, portefeuille équipondéré.
+
+\textbf{Séparation.} Tout paramètre réglé sur les données réelles (échelle des bandes, stop) l'est sur 2022 puis évalué sur 2023, avec un critère fixé avant les résultats.
+
+% =============================================================================
+\section{Premier résultat : la théorie tient sur simulation}\label{sec:sim}
+% =============================================================================
+
+Huit processus générateurs du spread (OU, queues de Student, volatilité stochastique, sauts, niveau moyen dérivant, régimes de $\theta$, rupture de cointégration, combinaison),
+calibrés sur les statistiques d'ADA/AVAX, avec $\beta=1{,}5$ inconnu du moteur. Rendement total moyen en \% ($16$ trajectoires de $6000$ barres,
+position $=100\,\%$ du capital). « Historique » : couverture de Kalman, seuils sur moyenne rapide, fenêtre $156$. « Oracle » : paramètres vrais.
+
+\begin{center}
+\small
+\begin{tabular}{lrrr}
+\toprule
+scénario & historique & corrigé & oracle\\
+\midrule
+OU pur & $-64$ & $381$ & $715$\\
++ queues de Student & $-48$ & $391$ & $701$\\
++ volatilité stochastique & $-54$ & $345$ & $1176$\\
++ sauts & $-66$ & $487$ & $939$\\
++ niveau moyen dérivant & $-63$ & $401$ & $672$\\
++ régimes de $\theta$ & $-60$ & $316$ & $865$\\
+rupture de cointégration & $-66$ & $119$ & $179$\\
+tout combiné & $-42$ & $464$ & $1636$\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Avec les vrais paramètres et sans couche de Kalman, le moteur réalise $337\,\%$ pour $335\,\%$ prédits ($147\,\%$ additifs capitalisés sur $3400$ barres, $\tilde c=0{,}066$).
+
+% =============================================================================
+\section{Second résultat : pas d'avantage brut en réel}\label{sec:reel}
+% =============================================================================
+
+Rendement du portefeuille équipondéré sur $2$ ans (en \%), moteur à couverture figée à l'entrée, coûts de base :
+
+\begin{center}
+\small
+\begin{tabular}{lrrr}
+\toprule
+ & coûts de base & coûts $\times2$ & coûts $\times4$\\
+\midrule
+configuration historique & $-9{,}7$ & $-28{,}2$ & $-54{,}6$\\
+moteur corrigé (couverture rafraîchie) & $-5{,}4$ & $-7{,}4$ & $-11{,}3$\\
+moteur corrigé (couverture figée à l'entrée) & $-5{,}6$ & $-6{,}3$ & $-7{,}8$\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Le rendement \emph{brut} (sans coûts) du moteur à couverture rafraîchie est de $-3{,}4\,\%$ (Sharpe $-1{,}0$) : les coûts ne sont pas la cause. $24\,\%$ des paires gagnent.
+Aucune des variantes suivantes ne produit un rendement brut positif : barrière causale sur l'ADF du spread ($0{,}10$, $0{,}05$, $0{,}01$),
+échelle des bandes $k\in\{1;1{,}5;2;3;4\}$, sortie à la moyenne au lieu du retournement.
+\textbf{Ces trois variantes et le rendement brut ont été mesurés avant le verrouillage de la couverture} (\S\ref{sec:meca}), c'est-à-dire sur le moteur à couverture rafraîchie.
+\acompleter{refaire le rendement brut, la barrière ADF, l'échelle des bandes et la sortie à la moyenne avec la couverture figée à l'entrée}
+
+\paragraph{Le retour à la moyenne existe, mais est plus faible que prévu.}
+Pour chaque barre calibrée on compare la variation réalisée du spread sur $h$ barres à la prédiction OU $-(1-e^{-\hat\theta h})(x_t-\hat\mu_t)$ :
+
+\begin{center}
+\small
+\begin{tabular}{lrrrr}
+\toprule
+horizon $h$ (barres) & $1$ & $6$ & $24$ & $72$\\
+pente (réalisé / prédit) & $0{,}31$ & $0{,}27$ & $0{,}31$ & $0{,}48$\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+La pente est positive pour $95$ à $99\,\%$ des paires, stable entre 2022 et 2023, mais $2$ à $4$ fois inférieure à $1$. Le niveau moyen dérive en outre en médiane de $0{,}72\,\sinf$ sur $200$ barres,
+au-delà de la demi-largeur de bande optimale ($\approx0{,}5\,\sinf$).
+
+% =============================================================================
+\section{Trois mécanismes de faux signal}\label{sec:meca}
+% =============================================================================
+
+\subsection{Spread recalculé à chaque rafraîchissement de la couverture}
+
+Soit $x^{(r)}_t=\log P^A_t-\beta_r\log P^B_t-\alpha_r$ le spread défini avec la couverture $(\beta_r,\alpha_r)$ estimée à la barre de rafraîchissement $r$. Une position ouverte à la barre $e$ est
+encaissée avec $\beta_e$ : son gain est la variation de $x^{(e)}$. Or le signal de sortie était évalué sur $x^{(r(t))}_t$, avec la couverture \emph{courante}. À un rafraîchissement le spread-signal saute de
+$-(\beta_{r}-\beta_{r-1})\log P^B_t$ (plus un terme d'intercept) ; ce saut n'est pas un gain, car la position porte toujours $\beta_e$.
+
+\textbf{Mesure} (retournements, $6$ premières paires du jeu ; unité : pb du notional par trade) :
+
+\begin{center}
+\small
+\begin{tabular}{lrrr}
+\toprule
+rafraîchissement & mouvement du signal & gain réalisé & écart\\
+\midrule
+toutes les $24$ barres & $215$ & $-48$ & $-262$\\
+toutes les $240$ barres & $108$ & $-19$ & $-127$\\
+toutes les $2400$ barres & $56$ & $+7$ & $-49$\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Une fois le spread mesuré avec la couverture d'entrée, le mouvement moyen du signal vaut $-49$ pb au lieu de $+198$ pb, et sa corrélation avec le gain réalisé passe à $0{,}93$ (puis $0{,}99$ avec la politique à couverture figée, où le signal et le gain sont égaux au premier ordre).
+\acompleter{refaire cette décomposition sur les 153 paires ; seules 6 paires sont mesurées}
+
+\paragraph{Correctif.} À l'ouverture on fige $\beta_e,\alpha_e$ et les niveaux de sortie ; le spread surveillé est $x^{(e)}$. Effet sur les $6$ paires : $804$ trades deviennent $266$ ; $56\,\%$ se terminent à l'autre bande (gain moyen $+760$ pb,
+$99\,\%$ de gagnants) mais $42\,\%$ ne reviennent pas et finissent à l'arrêt temporel ($-1300$ à $-2000$ pb).
+
+\begin{remarque}
+Le gain réalisé a toujours été calculé sur les prix ; ce qui était trompeur est le \emph{signal}. Au niveau du portefeuille, le verrouillage change peu le total ($-5{,}4\,\%$ contre $-5{,}6\,\%$) : il supprime l'apparence de signal, pas la perte.
+\end{remarque}
+
+\subsection{Innovation de Kalman comme spread}
+
+\begin{proposition}
+Si $\alpha$ est estimé avec un gain constant $K$ et $\beta$ supposé exact, l'innovation vaut $e=\dfrac{1-L}{1-(1-K)L}X$ ($L$ : opérateur retard). La fonction de transfert s'annule en fréquence nulle.
+\end{proposition}
+
+Pour $X$ AR(1) de coefficient $0{,}9$, l'autocorrélation d'ordre $1$ de l'innovation vaut $0{,}85$, $0{,}80$, $0{,}71$ pour $K=0{,}05;\,0{,}10;\,0{,}20$. Sur une paire simulée ($\beta=1{,}5$, $\varphi=0{,}98$) :
+
+\begin{center}
+\small
+\begin{tabular}{lrrr}
+\toprule
+couverture & $\hat\varphi$ du spread & rendement (\%) & \\
+\midrule
+innovation de Kalman & $0{,}72$ & $-62$ & \\
+OLS roulante (constante, $500$ barres) & $0{,}98$ & $+386$ & \\
+$\beta$ vrai & $0{,}98$ & $+570$ & \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Seuils ancrés sur une moyenne exponentielle rapide}
+
+Les niveaux $\mu\pm a\sinf$ étaient placés autour d'une moyenne exponentielle rapide $m_t$ du spread, et non du $\mu$ calibré. Le signal effectif $x_t-m_t$ est alors le même filtre passe-haut qu'au paragraphe précédent.
+À paramètres vrais, sans couche de Kalman, trois configurations (OU, $24$ trajectoires de $4000$ barres, position $=100\,\%$ du capital) :
+
+\begin{center}
+\small
+\begin{tabular}{lr}
+\toprule
+configuration & rendement (\%)\\
+\midrule
+seuils sur $m_t$ (moyenne rapide) & $84$\\
+seuils sur $\mu$ calibré & $337$\\
+théorie (capitalisée) & $335$\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\acompleter{table d'ablation couverture $\times$ ancrage $\times$ verrouillage sur les 153 paires réelles (8 combinaisons), pour isoler la contribution de chaque mécanisme}
+
+% =============================================================================
+\section{Ce qui reste vrai}\label{sec:reste}
+% =============================================================================
+
+\paragraph{Échelle des bandes} (moteur à couverture rafraîchie, voir \S\ref{sec:reel}). Sur $153$ paires, aucun $k\in\{1;1{,}5;2;3;4\}$ ne donne un rendement brut positif, ni en 2022 ni en 2023. Élargir réduit le nombre de trades et la perte (net 2023 : $-4{,}0\,\%$ à $k=1$, $-1{,}7\,\%$ à $k=4$) sans créer d'avantage.
+
+\paragraph{Stop adverse.} Défini en écarts-types stationnaires au-delà de la bande d'entrée, sur le spread à couverture figée, avec réarmement après le stop.
+Sur $2\,763$ trades de 2022, les excursions adverses séparent nettement les gagnants (médiane $1{,}3\,\sinf$, 90\textsuperscript{e} centile $4{,}4$) des perdants (médiane $6{,}6\,\sinf$, 90\textsuperscript{e} centile $16{,}9$). Un stop à $4\,\sinf$ coupe $75\,\%$ des perdants pour $13\,\%$ des gagnants.
+
+\begin{center}
+\small
+\begin{tabular}{lrrr}
+\toprule
+stop & Sharpe 2022 & Sharpe 2023 & rendement 2023 (\%)\\
+\midrule
+aucun & $-0{,}89$ & $-1{,}82$ & $-3{,}85$\\
+$1\,\sinf$ & $-1{,}77$ & $-4{,}22$ & $-2{,}90$\\
+$4\,\sinf$ (choisi sur 2022) & $-1{,}07$ & $-2{,}01$ & $-2{,}50$\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Le critère fixé à l'avance (meilleur Sharpe net en 2022 \emph{et} amélioration du Sharpe et du rendement en 2023) n'est pas satisfait : \textbf{le stop est non validé}. Il réduit le drawdown de 2023 de $-4{,}6\,\%$ à $-2{,}9\,\%$ ; c'est un contrôle de risque, pas une source de gain.
+
+% =============================================================================
+\section{Limites et menaces à la validité}\label{sec:limites}
+% =============================================================================
+
+\begin{itemize}[nosep]
+\item \textbf{Deux ans} seulement, un régime baissier puis une reprise ; aucune période postérieure à 2023.
+\item \textbf{Univers non causal} : actifs retenus d'après un volume récent (biais de survie) et paires filtrées par regroupement sur les corrélations de toute la période. Le test est causal pour la stratégie, pas pour la constitution de l'univers.
+\item \textbf{Barres horaires}, spot, sans financement ni impact de marché ; coût proportionnel $5$ pb par jambe.
+\item Le simulateur est calibré sur une paire (ADA/AVAX) ; les réglages par défaut du moteur ont été choisis dessus.
+\item Les décompositions par trade reposent à ce stade sur $6$ paires (\S\ref{sec:meca}).
+\item Les modèles d'apprentissage de signal (XGBoost) et la plateforme d'exécution ne sont pas évalués ici.
+\end{itemize}
+
+% =============================================================================
+\section{Annexe : le générateur de trajectoires}\label{sec:gen}
+% =============================================================================
+
+Une SDE neuronale conditionnelle (entraînée sur $45\,954$ fenêtres de $128$ barres, évaluée sur $2000$ fenêtres tirées dans les $10\,737$ de la période de validation) est comparée au réel
+et à une marche aléatoire gaussienne corrélée calée sur la volatilité et la corrélation du réel. Le plancher de bruit est la MMD de signature entre deux moitiés disjointes du réel.
+
+\begin{center}
+\small
+\begin{tabular}{lrrr}
+\toprule
+statistique (médiane) & réel & SDE & marche aléatoire\\
+\midrule
+écart-type du spread & $0{,}228$ & $0{,}246$ & $0{,}512$\\
+volatilité des incréments de A & $0{,}087$ & $0{,}064$ & $0{,}122$\\
+corrélation des incréments A,B & $0{,}60$ & $0{,}78$ & $0{,}45$\\
+kurtosis des incréments & $2{,}36$ & $-0{,}12$ & $-0{,}10$\\
+autocorrélation des incréments$^2$ & $0{,}087$ & $-0{,}012$ & $-0{,}014$\\
+$\theta$ AR(1) du spread & $0{,}115$ & $0{,}034$ & $0{,}034$\\
+fenêtres ADF $p<0{,}05$ (\%) & $41{,}6$ & $5{,}0$ & $4{,}5$\\
+MMD de signature & ($0{,}0022$) & $0{,}0247$ & $0{,}1072$\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Le modèle est quatre fois plus proche du réel que la marche aléatoire en MMD, mais ne reproduit ni le retour à la moyenne, ni les queues épaisses, ni le clustering de volatilité, et ignore ses descripteurs de conditionnement (la permutation des conditions ne change pas la MMD, $0{,}0246$ contre $0{,}0247$).
+Aucun surapprentissage mesuré ($0{,}0254$ en entraînement, $0{,}0247$ en validation). Le modèle est étendu (volatilité stochastique latente, bruit de Student, rappel à la moyenne explicite, lead-lag) ; \acompleter{résultats de l'entraînement du week-end et mise à jour de cette annexe}.
+
+\end{document}
