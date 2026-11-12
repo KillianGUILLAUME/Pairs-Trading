@@ -10,7 +10,7 @@ import pandas as pd
 from dataclasses import dataclass, field
 from typing import Optional
 from loguru import logger
-from iisignature import sig, prepare
+from neural_nets.signature_torch import sig_np as sig
 
 @dataclass
 class SignalGeneratorConfig:
@@ -196,7 +196,7 @@ class SignatureFeatures:
                 spread[start:end],
                 zscore[start:end],
             )
-            # iisignature : sig(path, depth)
+            # signature tronquée (pur torch) : sig(path, depth)
             s = sig(path, self.depth)
             results.append(s)
             indices.append(end - 1)

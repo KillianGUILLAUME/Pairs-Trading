@@ -28,7 +28,7 @@ def run_elite_validation(pair_a: str, pair_b: str):
     df = df.sort_values('timestamp').reset_index(drop=True)
     
     # 2. Setup Engine
-    engine = InstitutionalSignalEngine(window=elite_window, cost=elite_cost, use_kalman=True)
+    engine = InstitutionalSignalEngine(window=elite_window, cost=elite_cost)
     oracle_p = os.path.join(project_root, "data", "models", "institutional", "oracle_v3_universal.pkl")
     with open(oracle_p, "rb") as f:
         odata = pickle.load(f)

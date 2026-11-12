@@ -144,6 +144,9 @@ class RealisticPnLEngine:
             cap_prev = capital[i - 1]
             pos_i    = positions[i]
 
+            # --- 0) P&L brut du bar : notional porté PENDANT la barre (avant transition) ---
+            raw_pnl[i] = shifted_positions[i] * spread_return[i] * current_notional
+
             transition = (pos_i != prev_pos)
 
             # --- 1) Coûts de transaction (ouverture / fermeture / flip) ---
@@ -166,10 +169,7 @@ class RealisticPnLEngine:
                     pos_i, current_notional, bar_hours
                 )
 
-            # --- 3) P&L brut du bar ---
-            raw_pnl[i] = shifted_positions[i] * spread_return[i] * current_notional
-
-            # --- 4) Mise à jour capital ---
+            # --- 3) Mise à jour capital ---
             total_cost      = cost_tx_arr[i] + cost_fund_arr[i]
             capital[i]      = cap_prev + raw_pnl[i] - total_cost
             notional_arr[i] = current_notional
@@ -221,7 +221,10 @@ class StressTestEngine:
             signal.entry_long,
             signal.entry_short,
             signal.exit_signal,
-            dynamic_max_hold=168 # Default for stress testing
+            dynamic_max_hold=168, # Default for stress testing
+            exit_long=getattr(signal, "exit_long", None),
+            exit_short=getattr(signal, "exit_short", None),
+            allow_flip=bool(getattr(signal, "allow_flip", False)),
         )
 
         df = pnl_engine.compute(

@@ -47,9 +47,9 @@ def run_institutional_comparison(pair_a: str, pair_b: str):
 
     # 4. Exécution des deux Solveurs HJB
     results = {}
-    for solver_name in ["fpt", "dp"]:
+    for solver_name in ["ergodic", "fpt"]:
         logger.info(f"🧠 Calibrage & Résolution HJB ({solver_name.upper()}) + VETO ORACLE...")
-        engine = InstitutionalSignalEngine(window=156, solver_type=solver_name, cost=0.001)
+        engine = InstitutionalSignalEngine(solver_type=solver_name, cost=0.002)
         signal = engine.generate(ts, pa, pb)
         
         # Application du Veto Oracle

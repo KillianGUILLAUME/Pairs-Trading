@@ -16,7 +16,7 @@ from research.institutional.funding_estimator import FundingEstimator
 from research.sizing.portfolio_manager import PortfolioManager, PortfolioConfig
 from research.backtest.engine import BacktestEngine, BacktestConfig, PerformanceMetrics
 
-def process_single_pair(pair_a: str, pair_b: str, oracle_data: dict, window: int = 156):
+def process_single_pair(pair_a: str, pair_b: str, oracle_data: dict, window: int = 624):
     """
     Exécute la pipeline institutionnelle (HJB + Veto) sur une seule paire.
     """
@@ -32,7 +32,7 @@ def process_single_pair(pair_a: str, pair_b: str, oracle_data: dict, window: int
     pb = df['close_b'].values.astype(float)
     
     # Signaux HJB
-    engine = InstitutionalSignalEngine(window=window, solver_type="fpt", cost=0.001)
+    engine = InstitutionalSignalEngine(window=window, solver_type="ergodic", cost=0.002)
     signal = engine.generate(ts, pa, pb)
     
     # Oracle Veto & Probs
@@ -99,9 +99,9 @@ def run_multi_asset_institutional():
     pm = PortfolioManager(pm_cfg)
     
     probs_dict = {r["pair"]: r["probs"] for r in results}
-    # On suppose des stats de trades similaires pour l'instant (2% win / 1% loss)
-    win_rets = {r["pair"]: 0.02 for r in results}
-    loss_rets = {r["pair"]: 0.015 for r in results}
+    # Gain / perte par barre issus du solveur HJB de chaque paire (a + e - c ; stop_sd * sigma_inf + c)
+    win_rets = {r["pair"]: np.nan_to_num(r["signal"].win_return, nan=0.0) for r in results}
+    loss_rets = {r["pair"]: np.nan_to_num(r["signal"].loss_return, nan=0.0) for r in results}
     
     logger.info("💼 Calcul de l'Allocation Fractional Kelly Consolidée...")
     alloc_df = pm.allocate_vectorized(probs_dict, win_rets, loss_rets)

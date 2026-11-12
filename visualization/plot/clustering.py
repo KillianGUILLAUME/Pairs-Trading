@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from sklearn.decomposition import PCA
-from iisignature import sig
+from neural_nets.signature_torch import sig_np as sig
 from visualization.themes import BLOOMBERG
 
 def plot_trade_clusters(signal, pnl_df: pd.DataFrame, depth: int = 3) -> go.Figure:

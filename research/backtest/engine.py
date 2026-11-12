@@ -26,6 +26,7 @@ class BacktestConfig:
     slippage_bps:     float = 1.0
     beta_window:      int   = 120   # rolling OLS sur returns
     cooldown_bars:    int   = 6
+    time_stop_mult:   Optional[float] = 8.0   # arrêt temporel = mult x demi-vie estimée (min 20 barres) ; None = désactivé. 8 : coût < 1,5 % sur OU simulé, garde-fou résiduel
 
 # ============================================================
 # COST MODEL
@@ -54,7 +55,17 @@ class PositionManager:
         entry_short: np.ndarray,
         exit_signal: np.ndarray,
         dynamic_max_hold: int,
+        exit_long:  Optional[np.ndarray] = None,
+        exit_short: Optional[np.ndarray] = None,
+        allow_flip: bool = False,
     ) -> np.ndarray:
+        """
+        Machine à états : flat -> long/short sur signal d'entrée, retour à flat sur
+        signal de sortie ou durée max. Si `exit_long` / `exit_short` sont fournis
+        (sorties dépendantes du côté, ex. seuils HJB asymétriques), ils priment sur
+        `exit_signal` pour le côté correspondant. Si `allow_flip`, un signal d'entrée du côté
+        opposé retourne directement la position (long <-> short, sans passage à plat).
+        """
 
         n          = len(entry_long)
         positions  = np.zeros(n, dtype=np.float32)
@@ -79,9 +90,22 @@ class PositionManager:
             else:
                 holding  = i - entry_bar
 
+                if allow_flip and ((position == 1 and entry_short[i]) or (position == -1 and entry_long[i])):
+                    position  = -position
+                    entry_bar = i
+                    positions[i] = position
+                    continue
+
                 max_hold_reached = holding >= dynamic_max_hold
 
-                if exit_signal[i] or max_hold_reached:
+                if position == 1 and exit_long is not None:
+                    exit_now = bool(exit_long[i])
+                elif position == -1 and exit_short is not None:
+                    exit_now = bool(exit_short[i])
+                else:
+                    exit_now = bool(exit_signal[i])
+
+                if exit_now or max_hold_reached:
                     if holding < 12:
                         cooldown = self.cfg.cooldown_bars
                     position = 0
@@ -139,6 +163,11 @@ class PnLEngine:
             cap_prev = capital[i - 1]
             pos_i    = positions[i]
 
+            # P&L du bar : position et notional portés PENDANT la barre i, c'est-à-dire
+            # ceux décidés à la barre i-1 (pas de look-ahead). Calculé AVANT la
+            # transition de la barre i, sinon la barre de sortie n'est jamais créditée.
+            raw_pnl[i] = shifted_positions[i] * spread_return[i] * current_notional
+
             transition = (pos_i != prev_pos)
 
             if transition:
@@ -154,9 +183,6 @@ class PnLEngine:
                     current_notional = new_notional
                 else:
                     current_notional = 0.0
-
-            # P&L du bar (position shiftée pour éviter le look-ahead)
-            raw_pnl[i] = shifted_positions[i] * spread_return[i] * current_notional
 
             capital[i]      = cap_prev + raw_pnl[i] - cost_per_bar[i]
             notional_arr[i] = current_notional
@@ -212,8 +238,10 @@ class PerformanceMetrics:
         calmar    = ann_ret / abs(max_dd) if max_dd < 0 else 0.0
 
         pos        = df["position"].values
-        pos_change = np.diff(pos, prepend=0.0)
-        n_trades   = int((pos_change != 0).sum())
+        prev       = np.concatenate([[0.0], pos[:-1]])
+        # Un trade = une entrée (flat -> position, ou flip long <-> short). Les sorties
+        # ne sont pas comptées (l'ancienne version comptait entrées + sorties).
+        n_trades   = int(((pos != 0) & (pos != prev)).sum())
         pos_bars   = (pos != 0).sum()
 
         win_pnl  = pnl[pnl > 0].sum()
@@ -269,29 +297,49 @@ class BacktestEngine:
         self.pm         = PositionManager(self.cfg)
         self.pnl_engine = PnLEngine(self.cfg, self.costs)
 
-    def run(self, signal, label: str = "", allocations: Optional[np.ndarray] = None) -> dict:
+    def run(self, signal, label: str = "", allocations: Optional[np.ndarray] = None,
+            lock_hedge: bool = False, log_prices: Optional[tuple] = None,
+            stop_sd: Optional[float] = None) -> dict:
+        """
+        lock_hedge=True : politique à couverture verrouillée à l'entrée (voir research/institutional/locked_policy.py) ;
+        `log_prices=(log_a, log_b)` est alors requis (sinon calculé depuis signal.price_a / price_b).
+        """
 
         # label = label or f"{signal.symbol_a}×{signal.symbol_b}"
         # logger.info(f"Running backtest : {label}")
 
-        hl = compute_kalman_halflife(signal.spreads)
-        time_factor = 2.0
-        dynamic_max_hold = max(int(hl * time_factor), 20)
+        if self.cfg.time_stop_mult is None:
+            dynamic_max_hold = 10 ** 9
+        else:
+            hl = compute_kalman_halflife(signal.spreads)
+            dynamic_max_hold = max(int(hl * self.cfg.time_stop_mult), 20)
 
         # print(f'Dynamic Half Life : {hl}')
-        positions = self.pm.compute_positions(
-            signal.entry_long,
-            signal.entry_short,
-            signal.exit_signal,
-            dynamic_max_hold,
-        )
+        betas_used = signal.betas
+        trades = None
+        if lock_hedge:
+            from research.institutional.locked_policy import locked_positions
+            if log_prices is None:
+                log_prices = (np.log(np.asarray(signal.price_a, dtype=float)), np.log(np.asarray(signal.price_b, dtype=float)))
+            positions, betas_used, trades = locked_positions(signal, log_prices[0], log_prices[1], dynamic_max_hold,
+                                                              stop_sd=stop_sd, return_trades=True)
+        else:
+            positions = self.pm.compute_positions(
+                signal.entry_long,
+                signal.entry_short,
+                signal.exit_signal,
+                dynamic_max_hold,
+                exit_long=getattr(signal, "exit_long", None),
+                exit_short=getattr(signal, "exit_short", None),
+                allow_flip=bool(getattr(signal, "allow_flip", False)),
+            )
 
         df = self.pnl_engine.compute(
             positions,
             signal.spreads,
             signal.price_a,
             signal.price_b,
-            signal.betas,
+            betas_used,
             allocations=allocations,
         )
 
@@ -305,4 +353,4 @@ class BacktestEngine:
             # f"Trades={metrics['n_trades']}"
         # )
 
-        return {"metrics": metrics, "df": df, "positions": positions}
+        return {"metrics": metrics, "df": df, "positions": positions, "trades": trades}

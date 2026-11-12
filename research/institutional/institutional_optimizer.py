@@ -37,12 +37,12 @@ class InstitutionalOptimizer:
 
     def objective(self, trial):
         # 1. Hyperparams to optimize
-        hjb_window = trial.suggest_int("hjb_window", 100, 300, step=20)
+        hjb_window = trial.suggest_int("hjb_window", 312, 936, step=104)
         hjb_cost = trial.suggest_float("hjb_cost", 0.0005, 0.005)
         oracle_threshold = trial.suggest_float("oracle_threshold", 0.50, 0.60)
         
         # 2. Run Signal Engine
-        engine = InstitutionalSignalEngine(window=hjb_window, cost=hjb_cost, use_kalman=True)
+        engine = InstitutionalSignalEngine(window=hjb_window, cost=hjb_cost)
         ts = self.df['timestamp'].values
         pa = self.df['close_a'].values
         pb = self.df['close_b'].values

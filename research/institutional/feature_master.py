@@ -1,5 +1,5 @@
 import numpy as np
-import iisignature
+from neural_nets.signature_torch import sig_np
 from typing import Dict, List
 from scipy.stats import pearsonr
 from features.features_eng import (
@@ -28,7 +28,7 @@ class FeatureMaster:
         n = len(spread_path)
         times = np.linspace(0, 1, n)
         path = np.column_stack([times, spread_path])
-        return iisignature.sig(path, self.sig_level)
+        return sig_np(path, self.sig_level)
 
     def compute_lead_lag(self, ret_a: np.ndarray, ret_b: np.ndarray, max_lag: int = 5) -> Dict[str, float]:
         lags = range(-max_lag, max_lag + 1)

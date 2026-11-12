@@ -28,7 +28,8 @@ class LiveConfig:
     INITIAL_CASH = 1000.0 # Pour le calcul du sizing Kelly
     
     # --- Strategy Settings ---
-    HJB_WINDOW = 220
+    HJB_WINDOW = 624          # fenêtre de calibration OU (barres) ; testé en simulation : 156 << 312 < 624
+    HISTORY_BARS = 1000       # historique récupéré par paire (maximum d'un appel Binance) : couverture OLS (500) + fenêtre (624)
     HJB_RECALIB_FREQ = 8
     # 4. Filtre (Oracle)
     ORACLE_MODEL_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "models", "institutional", "oracle_v3_universal.pkl")

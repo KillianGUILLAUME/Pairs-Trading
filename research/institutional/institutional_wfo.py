@@ -19,7 +19,7 @@ class InstitutionalWFO:
     Bridge entre la nouvelle plateforme institutionnelle et le legacy Backtester.
     """
     def __init__(self, oracle_path: str, threshold: float = 0.55):
-        self.engine = InstitutionalSignalEngine(window=156, use_kalman=True)
+        self.engine = InstitutionalSignalEngine(cost=0.002)
         self.oracle_path = oracle_path
         self.threshold = threshold
         
@@ -97,21 +97,8 @@ class InstitutionalWFO:
         return res_train, res_test, res_stress
 
     def _slice_signal(self, sig, start, end):
-        # Helper to slice the InstitutionalSignal dataclass
-        from research.institutional.signal_engine import InstitutionalSignal
-        return InstitutionalSignal(
-            timestamps=sig.timestamps[start:end],
-            price_a=sig.price_a[start:end],
-            price_b=sig.price_b[start:end],
-            spreads=sig.spreads[start:end],
-            zscores=sig.zscores[start:end],
-            betas=sig.betas[start:end],
-            entry_long=sig.entry_long[start:end],
-            entry_short=sig.entry_short[start:end],
-            exit_signal=sig.exit_signal[start:end],
-            b_star=sig.b_star[start:end],
-            d_star=sig.d_star[start:end]
-        )
+        # Helper conservé pour compatibilité (appelé aussi sans instance : InstitutionalWFO._slice_signal(None, ...))
+        return sig.slice(start, end)
 
 if __name__ == "__main__":
     oracle_p = os.path.join(project_root, "data", "models", "institutional", "oracle_v2_universal.pkl")

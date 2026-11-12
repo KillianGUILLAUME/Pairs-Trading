@@ -14,7 +14,16 @@ class KalmanHedgeRatio:
         self.initialized = False
 
     def update(self, x, y):
-        # x: price_b, y: price_a
+        """
+        x: log price_b (régresseur), y: log price_a (observation).
+        Retourne (beta, alpha, innovation, S) où :
+            innovation = y - (beta_prior * x + alpha_prior)   [résidu A PRIORI]
+            S          = variance de l'innovation.
+        Le spread de trading doit être l'INNOVATION (calculée avec l'état prédit,
+        avant assimilation de la barre courante), pas le résidu a posteriori : en
+        régime stationnaire ce dernier vaut (1 - H K) x innovation, même dynamique
+        (θ AR(1) inchangé) mais amplitude et σ sous-estimés d'un facteur constant.
+        """
         state = np.array([x, 1.0])
         
         if not self.initialized:
@@ -26,9 +35,9 @@ class KalmanHedgeRatio:
         # P = P + Q
         self.P += self.delta / (1 - self.delta) * np.eye(2)
 
-        # Observation
+        # Observation : innovation a priori
         y_hat = np.dot(state, self.theta)
-        res = y - y_hat
+        innovation = y - y_hat
 
         # Mise à jour
         # S = H*P*H' + R
@@ -36,10 +45,10 @@ class KalmanHedgeRatio:
         # K = P*H' * inv(S)
         K = np.dot(self.P, state) / S
         
-        self.theta += K * res
+        self.theta += K * innovation
         self.P -= np.outer(K, np.dot(state, self.P))
         
-        return self.theta[0], self.theta[1] # Beta, Alpha
+        return self.theta[0], self.theta[1], float(innovation), float(S)  # Beta, Alpha, innovation, S
 
 class KalmanOUState:
     """
@@ -53,9 +62,11 @@ class KalmanOUState:
         self.R = r_obs # Bruit du spread (volatilité court terme)
         self.initialized = False
 
-    def update(self, spread, theta_dt):
+    def update(self, spread, theta_dt=None):
         """
-        theta_dt: vitesse de retour pré-estimée (ou constante).
+        Lissage exponentiel du spread (gain de Kalman stationnaire K = P/(P+R)).
+        NB : ce n'est pas un estimateur de μ au sens OU mais une moyenne mobile
+        adaptative ; `theta_dt` est conservé pour compatibilité et ignoré.
         """
         if not self.initialized:
             self.mu = spread

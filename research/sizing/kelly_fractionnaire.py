@@ -36,9 +36,20 @@ class FractionalKelly:
     def size_array(
         self,
         probs: np.ndarray,
-        win_return: float,
-        loss_return: float,
+        win_return,
+        loss_return,
     ) -> np.ndarray:
-        return np.array([
-            self.size(p, win_return, loss_return) for p in probs
-        ])
+        """
+        Taille Kelly fractionnée pour chaque probabilité. `win_return` et `loss_return` sont
+        des scalaires OU des tableaux de même longueur que `probs` (gain / perte propres à
+        chaque barre, ex. issus du solveur HJB). Les valeurs NaN ou nulles donnent 0.
+        """
+        probs = np.asarray(probs, dtype=float)
+        w = np.broadcast_to(np.asarray(win_return, dtype=float), probs.shape)
+        l = np.broadcast_to(np.asarray(loss_return, dtype=float), probs.shape)
+        ok = np.isfinite(probs) & np.isfinite(w) & np.isfinite(l) & (w >= 1e-6) & (l >= 1e-6)
+        out = np.zeros(probs.shape)
+        b = np.where(ok, w / np.where(l > 0, l, 1.0), 1.0)
+        kelly = np.where(ok, (probs * b - (1.0 - probs)) / b, 0.0)
+        out = np.minimum(np.maximum(kelly, 0.0) * self.fraction, self.max_leverage)
+        return np.where(ok, out, 0.0)

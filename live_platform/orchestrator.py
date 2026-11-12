@@ -44,7 +44,7 @@ class LiveOrchestrator:
         
         # Moteurs de décision
         print("DEBUG: Initializing engines...")
-        self.sig_engine = InstitutionalSignalEngine(window=cfg.HJB_WINDOW, cost=0.001)
+        self.sig_engine = InstitutionalSignalEngine(window=cfg.HJB_WINDOW, cost=0.002)
         self.fm = FeatureMaster(signature_level=2)
         
         pm_cfg = PortfolioConfig(
@@ -67,6 +67,8 @@ class LiveOrchestrator:
             
         pair_signals = {}
         probs_dict = {}
+        win_dict = {}
+        loss_dict = {}
         
         # 1. Pipeline de Signal pour chaque paire
         for (raw_a, raw_b) in cfg.get_pairs():
@@ -77,8 +79,8 @@ class LiveOrchestrator:
             logger.info(f"🔍 Scan de la paire {pair_label}...")
             
             # Fetch OHLCV
-            df_a = await self.bridge.fetch_ohlcv_dataframe(sym_a, limit=cfg.HJB_WINDOW + 20)
-            df_b = await self.bridge.fetch_ohlcv_dataframe(sym_b, limit=cfg.HJB_WINDOW + 20)
+            df_a = await self.bridge.fetch_ohlcv_dataframe(sym_a, limit=cfg.HISTORY_BARS)
+            df_b = await self.bridge.fetch_ohlcv_dataframe(sym_b, limit=cfg.HISTORY_BARS)
             
             pa = df_a['close'].values.astype(float)
             pb = df_b['close'].values.astype(float)
@@ -108,11 +110,13 @@ class LiveOrchestrator:
             
             pair_signals[pair_label] = signal
             probs_dict[pair_label] = prob
+            win_dict[pair_label] = np.array([np.nan_to_num(signal.win_return[-1], nan=0.0)])
+            loss_dict[pair_label] = np.array([np.nan_to_num(signal.loss_return[-1], nan=0.0)])
             await asyncio.sleep(0.1) # Soft rate limit
 
         # 2. Portfolio Allocation
         alloc_probs = {k: np.array([v]) for k, v in probs_dict.items()}
-        alloc_df = self.pm.allocate_vectorized(alloc_probs, {}, {})
+        alloc_df = self.pm.allocate_vectorized(alloc_probs, win_dict, loss_dict)
         
         # 3. Exécution (si non paper trading)
         execution_log = []
