@@ -13,8 +13,16 @@ venv/
 .venv/
 env/
 
-# Data (trop lourd pour git)
+# Données et modèles : versionnés par empreinte dans data/registry.json (scripts/data_registry.py),
+# octets sur S3. Git ne garde que le registre, les méta-données et les petits résultats texte.
 data/storage/
+!data/storage/screened/
+data/storage/screened/*
+!data/storage/screened/super_dataset_*_meta.json
+data/models/**/*.pt
+data/models/**/*.pkl
+data/models/**/*.parquet
+wandb/
 
 # Jupyter
 .ipynb_checkpoints/
@@ -38,3 +46,12 @@ logs/
 
 *.docx
 .docx
+
+# Journaux d'exécution et artefacts LaTeX
+logs/
+docs/*.aux
+docs/*.fls
+docs/*.fdb_latexmk
+docs/*.toc
+docs/*.out
+docs/*.synctex.gz

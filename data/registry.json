@@ -1,0 +1,173 @@
+{
+  "files": {
+    "data/models/hmm/btc_regime_hmm.pkl": {
+      "git_commit": "15c3c5b",
+      "note": "\u00e9tat au 2026-11-10 (audit P0)",
+      "registered": "2026-11-10T20:30:12",
+      "sha256": "91d29057245f264897c0f96b2748be6dea4f92c399cc76fda4cd3e5f31089b18",
+      "size": 2251
+    },
+    "data/models/institutional/elite_params_ADA_USDT_AVAX_USDT.pkl": {
+      "git_commit": "15c3c5b",
+      "note": "\u00e9tat au 2026-11-10 (audit P0)",
+      "registered": "2026-11-10T20:30:12",
+      "sha256": "26bf6cb895bc8063fa86c1e986a31b77425397591385862a3d69f97594c76d88",
+      "size": 79
+    },
+    "data/models/institutional/oracle_v2_ada_avax.pkl": {
+      "git_commit": "15c3c5b",
+      "note": "\u00e9tat au 2026-11-10 (audit P0)",
+      "registered": "2026-11-10T20:30:12",
+      "sha256": "bfba59154b16fe51e51f38e2641239b7169cc0595b62312dddff8d722d278aea",
+      "size": 326931
+    },
+    "data/models/institutional/oracle_v2_universal.pkl": {
+      "git_commit": "15c3c5b",
+      "note": "\u00e9tat au 2026-11-10 (audit P0)",
+      "registered": "2026-11-10T20:30:12",
+      "sha256": "9a39ef5da504e99d6bc1b9cd7d21d9eb1d7f2e9c37b252afa901152dcae19445",
+      "size": 2393044
+    },
+    "data/models/institutional/oracle_v3_universal.pkl": {
+      "git_commit": "15c3c5b",
+      "note": "\u00e9tat au 2026-11-10 (audit P0)",
+      "registered": "2026-11-10T20:30:12",
+      "sha256": "10ce3e68b76813364e06e4e9add0636d11395bbe5e3b200f162b6564b0f72a03",
+      "size": 12868505
+    },
+    "data/models/legacy/best_val_sde.pt": {
+      "git_commit": "15c3c5b",
+      "note": "\u00e9tat au 2026-11-10 (audit P0)",
+      "registered": "2026-11-10T20:30:12",
+      "sha256": "20188b1fb7b45addf282052fc08b5a33f14df420b28e4c45994b187d75236b1e",
+      "size": 2126530
+    },
+    "data/models/legacy/neural_sde_20260419_182621_world_model.pt": {
+      "git_commit": "15c3c5b",
+      "note": "\u00e9tat au 2026-11-10 (audit P0)",
+      "registered": "2026-11-10T20:30:12",
+      "sha256": "9c2e73e3d31128983cbf8d05c7f483a5ca42f485aab35bad4ab2bdc002f46bab",
+      "size": 2208434
+    },
+    "data/models/legacy/neural_sde_20260420_141305_world_model.pt": {
+      "git_commit": "15c3c5b",
+      "note": "\u00e9tat au 2026-11-10 (audit P0)",
+      "registered": "2026-11-10T20:30:12",
+      "sha256": "3b0975d235edeaff7e65eeb27582c85292d3fe278671471823c716338bb1a823",
+      "size": 2213290
+    },
+    "data/models/legacy/neural_sde_20260420_144203_world_model.pt": {
+      "git_commit": "15c3c5b",
+      "note": "\u00e9tat au 2026-11-10 (audit P0)",
+      "registered": "2026-11-10T20:30:12",
+      "sha256": "55cd72e2c434106e2ce2e0b5a24d52e7027e846029125f590e7c2145a43fb67f",
+      "size": 2212906
+    },
+    "data/models/legacy/neural_sde_20260420_152615_world_model.pt": {
+      "git_commit": "15c3c5b",
+      "note": "\u00e9tat au 2026-11-10 (audit P0)",
+      "registered": "2026-11-10T20:30:12",
+      "sha256": "f13c3a1f21838628b69a6f145d3f248ba1201aa20db51f3997ec065b2f3f28b5",
+      "size": 2212906
+    },
+    "data/models/legacy/neural_sde_20260420_155003_world_model.pt": {
+      "git_commit": "15c3c5b",
+      "note": "\u00e9tat au 2026-11-10 (audit P0)",
+      "registered": "2026-11-10T20:30:12",
+      "sha256": "51677dcdb38573c00088ec2b87fdafb031b1d3bf0579720dbb653be6bd6d04aa",
+      "size": 2212906
+    },
+    "data/models/legacy/neural_sde_20260420_173907_world_model.pt": {
+      "git_commit": "15c3c5b",
+      "note": "\u00e9tat au 2026-11-10 (audit P0)",
+      "registered": "2026-11-10T20:30:12",
+      "sha256": "d7b45d4e7973b22c4c18f70684d40f8080481cb1fba53fd5fea91451c52ab79a",
+      "size": 2210098
+    },
+    "data/models/legacy/neural_sde_20260420_191805_world_model.pt": {
+      "git_commit": "15c3c5b",
+      "note": "\u00e9tat au 2026-11-10 (audit P0)",
+      "registered": "2026-11-10T20:30:12",
+      "sha256": "c7a25cc107c64fd98bfa31a91e4838019771be6592cc2eec5110ddbb4e674029",
+      "size": 2210098
+    },
+    "data/models/meta_labeling/feature_names.pkl": {
+      "git_commit": "15c3c5b",
+      "note": "\u00e9tat au 2026-11-10 (audit P0)",
+      "registered": "2026-11-10T20:30:13",
+      "sha256": "561f2163388dacfd96926660847935e8a0cf847d50c03bbcf7a798f3b9fb96c7",
+      "size": 245
+    },
+    "data/models/meta_labeling/meta_dataset.parquet": {
+      "git_commit": "15c3c5b",
+      "note": "\u00e9tat au 2026-11-10 (audit P0)",
+      "registered": "2026-11-10T20:30:13",
+      "sha256": "5e338eb672199c5643d579b6cc3ef342b56cf6ab387820c1c9be16115f9fe95b",
+      "size": 74647
+    },
+    "data/models/meta_labeling/universal_dataset.parquet": {
+      "git_commit": "15c3c5b",
+      "note": "\u00e9tat au 2026-11-10 (audit P0)",
+      "registered": "2026-11-10T20:30:13",
+      "sha256": "53cd6d40be93c51d0051595e7c90462e4740c915477c78453aa81e215b19a55c",
+      "size": 5657609
+    },
+    "data/models/meta_labeling/universal_xgb_oracle.pkl": {
+      "git_commit": "15c3c5b",
+      "note": "\u00e9tat au 2026-11-10 (audit P0)",
+      "registered": "2026-11-10T20:30:13",
+      "sha256": "9261e1218f8d8174dbe5ce01fc149b0eb6cdc799f08361a1067540fa93d17f2b",
+      "size": 514013
+    },
+    "data/models/meta_labeling/xgboost_meta_label.pkl": {
+      "git_commit": "15c3c5b",
+      "note": "\u00e9tat au 2026-11-10 (audit P0)",
+      "registered": "2026-11-10T20:30:13",
+      "sha256": "7c0b5db19c9443562399d7714170222c219e000628e9bd32ac6cec5becb16b38",
+      "size": 399917
+    },
+    "data/models/neural_sde_20260421_001939_world_model.pt": {
+      "git_commit": "15c3c5b",
+      "note": "\u00e9tat au 2026-11-10 (audit P0)",
+      "registered": "2026-11-10T20:30:13",
+      "sha256": "bf0bff840a33f8831e6031067027ad503b13d8c720344e40d97cfc278b42b8f7",
+      "size": 584250
+    },
+    "data/models/seq2seq_ou_prior_cfm_20260327_143444_ZEC_USDTxXRP_USDT.pt": {
+      "git_commit": "15c3c5b",
+      "note": "\u00e9tat au 2026-11-10 (audit P0)",
+      "registered": "2026-11-10T20:30:13",
+      "sha256": "afae5c42d3945fac640b1b3c443e5c077872c5a1a5f029080012dbd6a085d0a9",
+      "size": 2758346
+    },
+    "data/models/seq2seq_ou_prior_cfm_20260327_161649_ZEC_USDTxXRP_USDT.pt": {
+      "git_commit": "15c3c5b",
+      "note": "\u00e9tat au 2026-11-10 (audit P0)",
+      "registered": "2026-11-10T20:30:13",
+      "sha256": "64a544924341a8c198e54c2601d15e237079c8551acb34e7cd95d72b8ce09b88",
+      "size": 2758346
+    },
+    "data/storage/screened/super_dataset_SDE_128.parquet": {
+      "git_commit": "15c3c5b",
+      "note": "\u00e9tat au 2026-11-10 (audit P0)",
+      "registered": "2026-11-10T20:30:13",
+      "sha256": "3449f61a957d17ea4b663fc098fd8a9b8d7d2e2c80cce6c5779217c07b7e18ae",
+      "size": 10681731
+    },
+    "data/storage/screened/super_dataset_SDE_128_causal.parquet": {
+      "git_commit": "15c3c5b",
+      "note": "dataset causal v1, 153 paires, 57443 fen\u00eatres",
+      "registered": "2026-11-10T21:47:52",
+      "sha256": "66fc6b599b49e6dafcd697fcdf0e2290e2719a528f670126c5ae05d0579bd4a7",
+      "size": 13718318
+    },
+    "data/storage/screened/super_dataset_SDE_128_causal_meta.json": {
+      "git_commit": "15c3c5b",
+      "note": "dataset causal v1, 153 paires, 57443 fen\u00eatres",
+      "registered": "2026-11-10T21:47:52",
+      "sha256": "e8072f58dd6213548f059afe3b89a685368020741d331365688a86182074b12a",
+      "size": 2216
+    }
+  },
+  "version": 1
+}
