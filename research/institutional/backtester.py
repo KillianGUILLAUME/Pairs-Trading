@@ -1,108 +1,99 @@
+"""
+research/institutional/backtester.py
+
+Chaîne HJB (+ oracle XGB) sur l'historique RÉEL d'une paire, pour les deux solveurs.
+
+  - politique à couverture verrouillée, arrêt temporel causal (`meta_labeling.make_chain`) ;
+  - l'oracle ne sert que s'il a été entraîné sur la chaîne évaluée, et seulement sur la période POSTÉRIEURE à son
+    apprentissage ; HJB seul et HJB + XGB sont comparés sur cette même période ;
+  - le coût de portage estimé entre dans le capital, donc dans les métriques.
+"""
+
 import os
+
+os.environ.setdefault("OMP_NUM_THREADS", "1")      # avant tout import numérique (voir run_generative_cvar.py)
+
 import sys
-project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.append(project_root)
 
 import numpy as np
 import pandas as pd
-import pickle
-import xgboost as xgb
 from loguru import logger
-import argparse
-from research.institutional.feature_master import FeatureMaster
-from research.backtest.engine import BacktestEngine, BacktestConfig, PerformanceMetrics
-from research.institutional.signal_engine import InstitutionalSignalEngine
-from research.institutional.funding_estimator import FundingEstimator
-from visualization.plot.spread import plot_spread_diagnostic
 
-def run_institutional_comparison(pair_a: str, pair_b: str):
-    logger.info(f"📍 ANALYSE INSTITUTIONNELLE : {pair_a} × {pair_b}")
-    
-    # 1. Chargement des données 1h
-    data_dir = os.path.join(project_root, "data", "storage", "parquet", "1h")
-    df_a = pd.read_parquet(os.path.join(data_dir, f"{pair_a}.parquet"))
-    df_b = pd.read_parquet(os.path.join(data_dir, f"{pair_b}.parquet"))
-    
-    # Merge on timestamp
-    df = pd.merge(df_a[['timestamp', 'close']], df_b[['timestamp', 'close']], on='timestamp', suffixes=('_a', '_b'))
-    df = df.sort_values('timestamp').reset_index(drop=True)
-    
-    ts = df['timestamp'].values
-    pa = df['close_a'].values.astype(float)
-    pb = df['close_b'].values.astype(float)
-    
-    # 2. Estimation du Funding
-    fe = FundingEstimator()
-    funding_a = fe.estimate_funding_series(pa)
-    funding_b = fe.estimate_funding_series(pb)
-    
-    # 3. Chargement de l'Oracle V2
-    oracle_path = os.path.join(project_root, "data", "models", "institutional", "oracle_v2_ada_avax.pkl")
-    with open(oracle_path, "rb") as f:
-        oracle_data = pickle.load(f)
-    oracle_model = oracle_data["model"]
-    oracle_features = oracle_data["features"]
-    fm = FeatureMaster(signature_level=2)
+project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.append(project_root)
+
+from research.backtest.engine import BacktestEngine, PerformanceMetrics                         # noqa: E402
+from research.backtest.real_walk_forward import load_pair                                       # noqa: E402
+from research.institutional.funding_estimator import FundingEstimator                           # noqa: E402
+from research.institutional.meta_labeling import (                                              # noqa: E402
+    ORACLE_PATH, MetaOracle, OracleMismatch, evaluation_start, make_chain,
+)
+
+MIN_BARS = 500      # période évaluée minimale
+
+
+def apply_carry(df_pnl: pd.DataFrame, funding_a: np.ndarray, funding_b: np.ndarray, initial_capital: float) -> pd.DataFrame:
+    """
+    Portage de la position TENUE pendant la barre (décidée à la barre précédente), sur le notional par jambe du trade,
+    jambe B pondérée par beta : un long A / short B paie le funding de A et reçoit beta x celui de B.
+    Le capital est recalculé : c'est sur lui que `PerformanceMetrics` lit rendement, Sharpe et drawdown.
+    """
+    out = df_pnl.copy()
+    held = out["position"].shift(1).fillna(0.0).to_numpy()
+    notional = out["notional"].shift(1).fillna(0.0).to_numpy()
+    carry = held * notional * (out["beta_r"].to_numpy() * funding_b - funding_a)
+    out["net_pnl"] = out["net_pnl"].to_numpy() + carry
+    out["capital"] = initial_capital + out["net_pnl"].cumsum()
+    return out
+
+
+def run_institutional_comparison(pair_a: str, pair_b: str, oracle_path: str = ORACLE_PATH) -> dict:
+    logger.info(f"Analyse institutionnelle : {pair_a} x {pair_b}")
+    df = load_pair(pair_a, pair_b)
+    ts = df["timestamp"].to_numpy()
+    pa, pb = df["a"].to_numpy(float), df["b"].to_numpy(float)
     log_a, log_b = np.log(pa), np.log(pb)
 
-    # 4. Exécution des deux Solveurs HJB
-    results = {}
-    for solver_name in ["ergodic", "fpt"]:
-        logger.info(f"🧠 Calibrage & Résolution HJB ({solver_name.upper()}) + VETO ORACLE...")
-        engine = InstitutionalSignalEngine(solver_type=solver_name, cost=0.002)
-        signal = engine.generate(ts, pa, pb)
-        
-        # Application du Veto Oracle
-        entries = np.where((signal.entry_long == 1) | (signal.entry_short == 1))[0]
-        veto_count = 0
-        
-        for idx in entries:
-            h_start = max(0, idx - 127)
-            if idx - h_start < 64: 
-                signal.entry_long[idx] = 0
-                signal.entry_short[idx] = 0
-                continue
-            
-            f_dict = fm.get_feature_vector(log_a[h_start:idx+1], log_b[h_start:idx+1])
-            f_dict["spread_at_entry"] = signal.spreads[idx]
-            f_dict["dist_to_mu"] = np.abs(signal.spreads[idx] - np.mean(signal.spreads[h_start:idx+1]))
-            
-            # Check feature alignment
-            x_vec = [f_dict.get(fname, 0.0) for fname in oracle_features]
-            prob = oracle_model.predict_proba(np.array([x_vec]))[0][1]
-            
-            if prob < 0.60:
-                signal.entry_long[idx] = 0
-                signal.entry_short[idx] = 0
-                veto_count += 1
-                
-        logger.info(f"🚫 Oracle Veto : {veto_count} trades rejetés sur {len(entries)}")
-        
-        # Backtest
-        bt_cfg = BacktestConfig(initial_capital=100000, position_size=0.10)
-        bt = BacktestEngine(bt_cfg)
-        bt_res = bt.run(signal)
-        df_pnl = bt_res["df"]
-        
-        # Application du carry
-        pos = df_pnl["position"].values
-        # Carry = -pos * fund_a + pos * fund_b (approximativement)
-        carry_pct = -pos * funding_a + pos * funding_b
-        df_pnl["net_pnl"] = df_pnl["net_pnl"] + (carry_pct * df_pnl["capital"].shift(1).fillna(100000))
-        
-        # Recompute metrics after carry
-        metrics = PerformanceMetrics.compute(df_pnl)
-        results[solver_name] = {"metrics": metrics, "signal": signal}
-        
-        logger.info(f"✅ {solver_name.upper()} : Sharpe={metrics['sharpe']} | PnL={metrics['total_return_pct']}%")
+    # Funding ESTIMÉ (modèle empirique, pas des taux réels) ; NaN sur la première fenêtre glissante
+    fe = FundingEstimator()
+    funding_a = np.nan_to_num(fe.estimate_funding_series(pa))
+    funding_b = np.nan_to_num(fe.estimate_funding_series(pb))
 
-    # 4. Comparaison Finale
-    logger.info("="*50)
-    logger.info("RÉSUMÉ COMPARATIF :")
-    for s, data in results.items():
-        m = data["metrics"]
-        logger.info(f"► {s.upper():3s} | Sharpe: {m['sharpe']:6.3f} | MDD: {m['max_dd']:6.2f}% | Final: ${m['final_capital']}")
-    logger.info("="*50)
+    results = {}
+    for solver_name in ("ergodic", "fpt"):
+        engine, cfg = make_chain(solver_type=solver_name)
+        start = evaluation_start(engine)
+        try:
+            oracle = MetaOracle.load(oracle_path, engine, cfg)
+            start = max(start, int(np.searchsorted(ts, oracle.train_end_ms)))
+        except (FileNotFoundError, OracleMismatch) as e:
+            logger.warning(f"{solver_name} : XGB désactivé, HJB seul ({e})")
+            oracle = None
+        if len(ts) - start < MIN_BARS:
+            logger.error(f"{solver_name} : {max(len(ts) - start, 0)} barres à évaluer, {MIN_BARS} requises.")
+            continue
+
+        signal = engine.generate(ts, pa, pb)
+        ahead = signal.slice(start, len(ts))
+        bt = BacktestEngine(cfg)
+        runs = {"HJB seul": bt.run(ahead, lock_hedge=True)}
+        if oracle is not None:
+            runs["HJB + XGB"] = bt.run(ahead, lock_hedge=True, keep_trade=oracle.gate(log_a, log_b, signal, offset=start))
+            kept = sum(t["kept"] for t in runs["HJB + XGB"]["trades"])
+            logger.info(f"{solver_name} : XGB garde {kept} trades sur {len(runs['HJB + XGB']['trades'])}")
+
+        for name, res in runs.items():
+            df_pnl = apply_carry(res["df"], funding_a[start:], funding_b[start:], cfg.initial_capital)
+            results[f"{solver_name} | {name}"] = {"metrics": PerformanceMetrics.compute(df_pnl), "signal": signal}
+
+    logger.info("=" * 60)
+    for name, r in results.items():
+        m = r["metrics"]
+        logger.info(f"{name:<22} | Sharpe {m['sharpe']:6.3f} | rendement {m['total_return_pct']:7.2f}% | "
+                    f"MDD {m['max_dd']:6.2f}% | trades {m['n_trades']}")
+    logger.info("=" * 60)
+    return results
+
 
 if __name__ == "__main__":
     run_institutional_comparison("ADA_USDT", "AVAX_USDT")

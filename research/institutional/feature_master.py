@@ -44,8 +44,14 @@ class FeatureMaster:
         asymmetry = corrs.get("lag_1", 0) - corrs.get("lag_-1", 0)
         return {"lead_lag_asymmetry": asymmetry}
 
-    def get_feature_vector(self, log_a: np.ndarray, log_b: np.ndarray) -> Dict[str, float]:
-        spread = log_a - log_b
+    def get_feature_vector(self, log_a: np.ndarray, log_b: np.ndarray,
+                           beta: float = 1.0, alpha: float = 0.0) -> Dict[str, float]:
+        """
+        Features d'une fenêtre. `beta`, `alpha` : couverture du spread décrit (log A - beta log B - alpha).
+        Les défauts (1, 0) donnent le log-ratio, qui n'est PAS le spread tradé par le moteur HJB : le méta-label
+        doit passer la couverture d'entrée (voir `meta_labeling.entry_features`).
+        """
+        spread = log_a - beta * log_b - alpha
         ret_a = np.diff(log_a)
         ret_b = np.diff(log_b)
         ret_spread = np.diff(spread)

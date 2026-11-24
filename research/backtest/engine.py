@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 import statsmodels.api as sm
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 from loguru import logger
 
 # ============================================================
@@ -27,6 +27,9 @@ class BacktestConfig:
     beta_window:      int   = 120   # rolling OLS sur returns
     cooldown_bars:    int   = 6
     time_stop_mult:   Optional[float] = 8.0   # arrêt temporel = mult x demi-vie estimée (min 20 barres) ; None = désactivé. 8 : coût < 1,5 % sur OU simulé, garde-fou résiduel
+    # False (défaut, chiffres publiés) : demi-vie estimée sur TOUTE la série, donc avec le futur.
+    # True : demi-vie lue à l'entrée de chaque trade (θ calibré sur le passé) ; exige lock_hedge=True.
+    time_stop_causal: bool  = False
 
 # ============================================================
 # COST MODEL
@@ -289,6 +292,17 @@ def compute_kalman_halflife(spread_array: np.ndarray) -> float:
     hl = -np.log(2) / lam
     return float(hl)
 
+def causal_max_hold(theta_hat: np.ndarray, mult: float, max_half_life: float = 336.0) -> np.ndarray:
+    """
+    Durée maximale de détention PAR BARRE : mult x ln 2 / θ, avec θ calibré sur le passé (min 20 barres).
+    La demi-vie est plafonnée à `max_half_life` (même repli que `compute_kalman_halflife` sans retour à la moyenne).
+    """
+    theta = np.asarray(theta_hat, dtype=float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        hl = np.log(2.0) / theta
+    hl = np.where(np.isfinite(hl) & (hl > 0), np.minimum(hl, max_half_life), max_half_life)
+    return np.maximum(np.floor(hl * mult), 20.0)
+
 class BacktestEngine:
 
     def __init__(self, config: Optional[BacktestConfig] = None):
@@ -299,17 +313,29 @@ class BacktestEngine:
 
     def run(self, signal, label: str = "", allocations: Optional[np.ndarray] = None,
             lock_hedge: bool = False, log_prices: Optional[tuple] = None,
-            stop_sd: Optional[float] = None) -> dict:
+            stop_sd: Optional[float] = None, keep_trade: Optional[Callable[[dict], bool]] = None) -> dict:
         """
         lock_hedge=True : politique à couverture verrouillée à l'entrée (voir research/institutional/locked_policy.py) ;
         `log_prices=(log_a, log_b)` est alors requis (sinon calculé depuis signal.price_a / price_b).
+
+        keep_trade : filtre de méta-label, appelé UNE fois par trade de la politique avec son dictionnaire
+        (entry, exit, side, kind, mae_sd). Un trade rejeté est remplacé par une position nulle sur toute sa durée ;
+        les autres trades sont inchangés. Pour rester causal le filtre ne doit lire que `entry` et `side` (et le
+        passé) : `exit`, `kind` et `mae_sd` sont connus après coup. Exige lock_hedge=True.
         """
 
         # label = label or f"{signal.symbol_a}×{signal.symbol_b}"
         # logger.info(f"Running backtest : {label}")
 
+        if keep_trade is not None and not lock_hedge:
+            raise ValueError("keep_trade exige lock_hedge=True (le filtre porte sur les trades de la politique verrouillée)")
+
         if self.cfg.time_stop_mult is None:
             dynamic_max_hold = 10 ** 9
+        elif self.cfg.time_stop_causal:
+            if not lock_hedge:
+                raise ValueError("time_stop_causal exige lock_hedge=True")
+            dynamic_max_hold = causal_max_hold(signal.theta_hat, self.cfg.time_stop_mult)
         else:
             hl = compute_kalman_halflife(signal.spreads)
             dynamic_max_hold = max(int(hl * self.cfg.time_stop_mult), 20)
@@ -323,6 +349,13 @@ class BacktestEngine:
                 log_prices = (np.log(np.asarray(signal.price_a, dtype=float)), np.log(np.asarray(signal.price_b, dtype=float)))
             positions, betas_used, trades = locked_positions(signal, log_prices[0], log_prices[1], dynamic_max_hold,
                                                               stop_sd=stop_sd, return_trades=True)
+            if keep_trade is not None:
+                for t in trades:
+                    t["kept"] = bool(keep_trade(t))
+                    if not t["kept"]:
+                        # Trade encore ouvert en fin de série : la dernière barre est aussi en position.
+                        end = len(positions) if t["kind"] == "fin de série" else t["exit"]
+                        positions[t["entry"]:end] = 0
         else:
             positions = self.pm.compute_positions(
                 signal.entry_long,

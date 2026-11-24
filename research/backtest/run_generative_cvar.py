@@ -1,270 +1,209 @@
+"""
+research/backtest/run_generative_cvar.py
+
+Chaîne générateur -> HJB -> XGB, en distribution :
+
+  1. historique RÉEL de la paire jusqu'à un point d'ancrage : c'est lui qui calibre la couverture, l'OU et les seuils ;
+  2. générateur : `n_paths` prolongements synthétiques ancrés sur la dernière barre réelle, de la longueur
+     d'entraînement du générateur par défaut (au-delà : extrapolation non validée) ;
+  3. moteur HJB sur [historique réel + prolongement], à plat à l'ancrage ; seul le prolongement est évalué ;
+  4. oracle XGB (méta-label) : garde ou rejette CHAQUE trade du moteur, une fois, à l'entrée. Sans oracle entraîné
+     sur cette chaîne et avant l'ancrage, l'étape est sautée et signalée.
+
+Le résultat est la dispersion du gain SOUS LA LOI DU GÉNÉRATEUR. Il ne valide ni le moteur ni l'oracle : un filtre qui
+« marche » sur des trajectoires synthétiques mesure le générateur. Le jugement de l'oracle se fait sur trades réels hors
+échantillon (universal_oracle_trainer.py, backtester.py).
+
+    python research/backtest/run_generative_cvar.py --pair_a ADA_USDT --pair_b AVAX_USDT --n_paths 200
+"""
+
 import os
+
+# torch (libiomp5), scikit-learn et XGBoost (libomp) chargent chacun leur runtime OpenMP. Observé sur Mac : avec les
+# trois dans le processus, la génération se bloque à 0 % de CPU ; avec un seul thread, 20 trajectoires de 2000 barres
+# prennent 5 s. À fixer AVANT tout import numérique.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+
+import argparse
 import sys
-import json
-import pickle
+
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import seaborn as sns
 from loguru import logger
 from tqdm import tqdm
-import matplotlib.pyplot as plt
-import seaborn as sns
-import argparse
-import xgboost as xgb
 
 project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(project_root)
 
-from research.backtest.generative_sde_engine import GenerativeSDEEngine
-from research.backtest.engine import BacktestEngine, BacktestConfig
-from research.signals.signal_generator import SignalGenerator, SignalGeneratorConfig
-from features.features_eng import get_screener_feature_dict
-from research.models.hmm_regimes.inference import RegimeDetector
+from research.backtest.engine import BacktestEngine                                    # noqa: E402
+from research.backtest.generative_sde_engine import GenerativeSDEEngine                # noqa: E402
+from research.institutional.meta_labeling import (                                     # noqa: E402
+    ORACLE_PATH, MetaOracle, OracleMismatch, evaluation_start, make_chain,
+)
 
-def run_generative_cvar(pair_a, pair_b, n_paths=200, bars=2000):
-    logger.info("=" * 60)
-    logger.info(f"🧬 GÉNÉRATION CVaR & STRESS TEST MULTIVERS : {pair_a} × {pair_b}")
-    logger.info("=" * 60)
-    
-    # 1. Load Parameters
-    params_path = os.path.join(project_root, "data", "storage", "optimized_params", f"{pair_a}x{pair_b}_best_params.json")
-    if not os.path.exists(params_path):
-        logger.error(f"❌ Impossible de trouver {params_path}. Exécute d'abord run_full_pipeline.py !")
-        return
-        
-    with open(params_path, "r") as f:
-        best_params = json.load(f)
-        
-    logger.info(f"📄 Paramètres chargés : Z-Score={best_params['zscore_window']}, Entry={best_params['entry_threshold']}")
-    
-    # 2. Configurer les Moteurs
-    bt_cfg = BacktestConfig(
-        position_size=best_params["position_size"],
-        stop_loss_z=best_params["stop_loss_z"],
-        max_holding_bars=best_params["max_holding_bars"],
-        cooldown_bars=best_params["cooldown_bars"]
-    )
-    sig_cfg = SignalGeneratorConfig(
-        zscore_window=best_params["zscore_window"],
-        entry_threshold=best_params["entry_threshold"],
-        exit_threshold=best_params["exit_threshold"],
-        compute_signature=False
-    )
-    
-    logger.info("Initializing bt_engine")
-    bt_engine = BacktestEngine(bt_cfg)
-    logger.info("Initializing sig_gen")
-    sig_gen = SignalGenerator(**sig_cfg.__dict__)
-    
-    # 3. Charger les Modèles ML (XGBoost et HMM)
-    hmm_path = os.path.join(project_root, "data", "models", "hmm", "btc_regime_hmm.pkl")
-    xgb_path = os.path.join(project_root, "data", "models", "meta_labeling", "universal_xgb_oracle.pkl")
-    
-    try:
-        logger.info("Initializing HMM")
-        hmm_oracle = RegimeDetector(hmm_path)
-        logger.info("HMM success")
-    except Exception as e:
-        logger.error(f"HMM error: {e}")
-        hmm_oracle = None
-        
-    try:
-        logger.info("Initializing XGBoost")
-        with open(xgb_path, "rb") as f:
-            xgb_data = pickle.load(f)
-        xgb_model = xgb_data["model"]
-        xgb_features = xgb_data["features"]
-        logger.info("XGBoost success")
-    except Exception as e:
-        logger.error(f"❌ Oracle XGBoost introuvable: {e}")
-        return
-        
-    # 4. Préparer le contexte Macro (BTC / ETH pour les features XGB)
+PATHS_DIR = os.path.join(project_root, "data", "storage", "synthetic_paths")
+MAX_PRICE_RATIO = 1e3      # au-delà, la trajectoire a divergé : rejetée et comptée
+
+
+def load_aligned(pair_a: str, pair_b: str) -> pd.DataFrame:
+    """Clôtures (a, b, btc, eth) alignées PAR TIMESTAMP : intersection des quatre séries."""
     data_dir = os.path.join(project_root, "data", "storage", "parquet", "1h")
-    df_btc = pd.read_parquet(os.path.join(data_dir, "BTC_USDT.parquet")).set_index('timestamp')['close']
-    df_eth = pd.read_parquet(os.path.join(data_dir, "ETH_USDT.parquet")).set_index('timestamp')['close']
-    df_a = pd.read_parquet(os.path.join(data_dir, f"{pair_a}.parquet")).set_index('timestamp')['close']
-    df_b = pd.read_parquet(os.path.join(data_dir, f"{pair_b}.parquet")).set_index('timestamp')['close']
-    
-    price_btc = df_btc.values[-bars:]
-    price_eth = df_eth.values[-bars:]
-    
-    # 5. Generative SDE Paths
-    # We dynamically look for the SDE .pt file for this pair
+
+    def close(symbol: str) -> pd.Series:
+        return pd.read_parquet(os.path.join(data_dir, f"{symbol}.parquet")).set_index("timestamp")["close"].astype(float)
+
+    series = {"a": close(pair_a), "b": close(pair_b), "btc": close("BTC_USDT"), "eth": close("ETH_USDT")}
+    return pd.concat(series, axis=1, join="inner").dropna().sort_index()
+
+
+def latest_checkpoint() -> str:
     models_dir = os.path.join(project_root, "data", "models")
-    sde_models = [
-        f for f in os.listdir(models_dir)
-        if f.startswith("neural_sde_") and f.endswith("world_model.pt") 
-    ]
-    
-    if not sde_models:
-        logger.error(f"❌ Aucun modèle SDE trouvé pour {pair_a} / {pair_b}. Modèle attendu dans {models_dir}.")
-        return
-        
-    sde_models.sort(reverse=True)
-    sde_model_path = os.path.join(models_dir, sde_models[0])
-    logger.info(f"Loading Neural SDE from {sde_model_path}...")
-        
-    # Cache indexé par paire, nombre de chemins, horizon ET modèle (un cache sans le modèle devenait périmé).
-    model_stem = os.path.splitext(sde_models[0])[0]
-    synths_path = os.path.join(project_root, "data", "storage", "synthetic_paths", f"{pair_a}x{pair_b}_{n_paths}_{bars}_{model_stem}.parquet")
-    
-    p_a_init = df_a.iloc[-bars]
-    p_b_init = df_b.iloc[-bars]
-    
-    if os.path.exists(synths_path):
-        logger.info(f"📂 Chargement des trajectoires SDE CACHÉES depuis {synths_path}")
-        df_paths = pd.read_parquet(synths_path)
-        synthetic_markets = [group for _, group in df_paths.groupby(level=0)]
+    names = sorted(f for f in os.listdir(models_dir) if f.startswith("neural_sde_") and f.endswith("world_model.pt"))
+    if not names:
+        raise FileNotFoundError(f"Aucun checkpoint neural_sde_*world_model.pt dans {models_dir}")
+    return os.path.join(models_dir, names[-1])       # noms horodatés : le dernier est le plus récent
+
+
+def synthetic_markets(sde: GenerativeSDEEngine, label: str, aligned: pd.DataFrame, anchor: int, horizon: int,
+                      n_paths: int, seed: int) -> list:
+    """
+    `n_paths` prolongements de `horizon` barres (plus la barre d'ancrage, indice 0), en cache. La clé contient tout ce
+    qui change les trajectoires : ancrage (donc prix initiaux et conditions), horizon, graine et checkpoint.
+    """
+    stem = os.path.splitext(os.path.basename(sde.model_path))[0]
+    path = os.path.join(PATHS_DIR, f"{label}_n{n_paths}_h{horizon}_s{seed}_t{int(aligned.index[anchor])}_{stem}.parquet")
+    if os.path.exists(path):
+        logger.info(f"Trajectoires en cache : {path}")
+        return [g for _, g in pd.read_parquet(path).groupby(level=0)]
+
+    conditions = None
+    if sde.conditioning is not None:
+        hist = np.log(aligned.iloc[:anchor + 1])     # se termine à l'ancrage, rien après
+        conditions = sde.conditions_from_history(*(hist[c].to_numpy() for c in ("a", "b", "btc", "eth")))
     else:
-        logger.info(f"⏳ Génération de {n_paths} trajectoires mathématiques (SDE Multiverse)...")
-        sde_engine = GenerativeSDEEngine(model_path=sde_model_path)
-        # Conditionnement causal sur l'historique réel précédant le point d'ancrage (si le checkpoint le permet)
-        conditions = None
-        if sde_engine.conditioning is not None:
-            W = int(sde_engine.conditioning["past_window"]) + 1
-            conditions = sde_engine.conditions_from_history(
-                np.log(df_a.values[-bars - W:-bars + 1].astype(float)), np.log(df_b.values[-bars - W:-bars + 1].astype(float)),
-                np.log(df_btc.values[-bars - W:-bars + 1].astype(float)), np.log(df_eth.values[-bars - W:-bars + 1].astype(float)),
-            )
-            logger.info("🧭 Conditionnement causal calculé sur l'historique réel.")
-        else:
-            logger.warning("Checkpoint sans métadonnées de conditionnement : génération avec conditions nulles (fenêtre moyenne).")
-        synthetic_markets = sde_engine.simulate_markets(n_paths=n_paths, bars=bars, p_a_init=p_a_init, p_b_init=p_b_init, conditions=conditions)
-        
-        # Caching
-        os.makedirs(os.path.dirname(synths_path), exist_ok=True)
-        df_concat = pd.concat(synthetic_markets, keys=range(n_paths))
-        df_concat.to_parquet(synths_path)
-        logger.info(f"💾 Trajectoires SDE en Cache : {synths_path}")
+        logger.warning("Checkpoint sans métadonnées de conditionnement : conditions nulles (fenêtre moyenne).")
+    markets = sde.simulate_markets(n_paths=n_paths, bars=horizon + 1, p_a_init=float(aligned["a"].iloc[anchor]),
+                                   p_b_init=float(aligned["b"].iloc[anchor]), conditions=conditions, seed=seed)
+    os.makedirs(PATHS_DIR, exist_ok=True)
+    pd.concat(markets, keys=range(n_paths)).to_parquet(path)
+    logger.info(f"Trajectoires mises en cache : {path}")
+    return markets
 
-    # 6. Evaluation Walk-Forward sur les univers synthétiques
-    all_pure = []
-    all_xgb = []
-    n_divergent = 0
-    
-    log_btc = np.log(price_btc.astype(float))
-    log_eth = np.log(price_eth.astype(float))
-    
-    for i, market_df in tqdm(enumerate(synthetic_markets), total=n_paths, desc="🧪 Stress-Test"):
-        timestamps = np.arange(bars)
-        price_a = market_df["SYNTH_A"].values.astype(float)
-        price_b = market_df["SYNTH_B"].values.astype(float)
-        
-        # Un chemin divergent (prix non finis ou > x1000) est REJETÉ et compté, pas masqué.
-        if (not np.all(np.isfinite(price_a)) or not np.all(np.isfinite(price_b))
-                or price_a.max() / price_a.min() > 1e3 or price_b.max() / price_b.min() > 1e3):
-            n_divergent += 1
-            continue
-        
-        # A. Stat ArB Pure
-        signal = sig_gen.generate(timestamps, price_a, price_b, symbol_a=pair_a, symbol_b=pair_b)
-        res_pure = bt_engine.run(signal, label=f"Path_{i}_PURE")
-        metric_pure = res_pure["metrics"]
-        all_pure.append(metric_pure)
-        
-        # B. XGBoost Oracle Filtered
-        e_long = np.copy(signal.entry_long)
-        e_short = np.copy(signal.entry_short)
-        signal_indices = np.where((e_long == 1) | (e_short == 1))[0]
-        
-        log_a = np.log(price_a.astype(float))
-        log_b = np.log(price_b.astype(float))
-        zscores = signal.zscores
-        
-        for idx in signal_indices:
-            h_start = max(0, idx - 127)
-            # Feature extraction
-            feat_dict = get_screener_feature_dict(
-                log_a[h_start:idx+1], log_b[h_start:idx+1], log_btc[h_start:idx+1], log_eth[h_start:idx+1]
-            )
-            feat_dict["entry_z"] = float(zscores[idx])
-            
-            if hmm_oracle is not None:
-                r_probs = hmm_oracle.predict_proba(log_btc[h_start:idx+1])
-                feat_dict["hmm_regime_0"] = r_probs[0]
-                feat_dict["hmm_regime_1"] = r_probs[1]
-                feat_dict["hmm_regime_2"] = r_probs[2]
-            else:
-                feat_dict["hmm_regime_0"] = 0.0
-                feat_dict["hmm_regime_1"] = 0.0
-                feat_dict["hmm_regime_2"] = 0.0
-                
-            feat_vector = [feat_dict.get(c, 0.0) if np.isfinite(feat_dict.get(c, 0.0)) else 0.0 for c in xgb_features]
-            x_arr = np.array(feat_vector, dtype=np.float32).reshape(1, -1)
-            
-            pred_prob = xgb_model.predict_proba(x_arr)[0][1]
-            if pred_prob < 0.80:
-                e_long[idx] = 0
-                e_short[idx] = 0
-                
-        signal.entry_long = e_long
-        signal.entry_short = e_short
-        
-        res_xgb = bt_engine.run(signal, label=f"Path_{i}_XGB")
-        metric_xgb = res_xgb["metrics"]
-        all_xgb.append(metric_xgb)
-        
-    # 7. Agrégation Statistique et Calculs CVaR (95%)
-    if n_divergent:
-        logger.warning(f"⚠️ {n_divergent}/{n_paths} trajectoires divergentes rejetées (le taux doit rester marginal).")
-    if not all_pure:
-        logger.error("Aucune trajectoire exploitable.")
-        return
-    df_pure = pd.DataFrame(all_pure)
-    df_xgb = pd.DataFrame(all_xgb)
-    
-    var_95_ret_pure = np.percentile(df_pure['total_return_pct'], 5)
-    cvar_95_ret_pure = df_pure[df_pure['total_return_pct'] <= var_95_ret_pure]['total_return_pct'].mean()
-    
-    var_95_ret_xgb = np.percentile(df_xgb['total_return_pct'], 5)
-    cvar_95_ret_xgb = df_xgb[df_xgb['total_return_pct'] <= var_95_ret_xgb]['total_return_pct'].mean()
-    
-    var_95_dd_pure = np.percentile(df_pure['max_dd'], 5)
-    var_95_dd_xgb = np.percentile(df_xgb['max_dd'], 5)
-    
-    logger.info("\n" + "="*70)
-    logger.info(f"💎 RÉSULTATS GÉNÉRATIFS ({n_paths} MULTIVERS - CONFIANCE 95%)")
-    logger.info("="*70)
-    logger.info(f"{'MÉTRIQUE':<25} | {'STRATÉGIE PURE':<20} | {'XGBOOST ORACLE':<20}")
-    logger.info("-"*70)
-    logger.info(f"{'Sharpe Moyen':<25} | {df_pure['sharpe'].mean():<20.3f} | {df_xgb['sharpe'].mean():<20.3f}")
-    logger.info(f"{'PnL Moyen (%)':<25} | {df_pure['total_return_pct'].mean():<20.2f} | {df_xgb['total_return_pct'].mean():<20.2f}")
-    logger.info(f"{'Drawdown Moyen (%)':<25} | {df_pure['max_dd'].mean():<20.2f} | {df_xgb['max_dd'].mean():<20.2f}")
-    logger.info("-"*70)
-    logger.info(f"{'VaR 95% PnL (%)':<25} | {var_95_ret_pure:<20.2f} | {var_95_ret_xgb:<20.2f}")
-    logger.info(f"{'CVaR 95% Crash Moyen (%)':<25} | {cvar_95_ret_pure:<20.2f} | {cvar_95_ret_xgb:<20.2f}")
-    logger.info(f"{'VaR 95% Pire Drawdown (%)':<25} | {var_95_dd_pure:<20.2f} | {var_95_dd_xgb:<20.2f}")
-    logger.info("="*70)
 
-    # 8. Visuels
-    plt.style.use('dark_background')
+def diverged(price: np.ndarray) -> bool:
+    return not np.all(np.isfinite(price)) or price.min() <= 0 or price.max() / price.min() > MAX_PRICE_RATIO
+
+
+def summarize(metrics: pd.DataFrame) -> dict:
+    ret = metrics["total_return_pct"]
+    var = np.percentile(ret, 5)
+    return {
+        "Sharpe moyen": metrics["sharpe"].mean(),
+        "PnL moyen (%)": ret.mean(),
+        "Drawdown moyen (%)": metrics["max_dd"].mean(),
+        "VaR 95% PnL (%)": var,
+        "CVaR 95% PnL (%)": ret[ret <= var].mean(),
+        "Drawdown, 5e centile (%)": np.percentile(metrics["max_dd"], 5),
+        "Trades par trajectoire": metrics["n_trades"].mean(),
+    }
+
+
+def plot_distributions(runs: dict, title: str, path: str) -> None:
+    plt.style.use("dark_background")
     fig, axes = plt.subplots(1, 2, figsize=(15, 6))
-    
-    sns.kdeplot(df_pure['total_return_pct'], ax=axes[0], color='red', label='Pure Stat Arb', fill=True, alpha=0.3)
-    sns.kdeplot(df_xgb['total_return_pct'], ax=axes[0], color='cyan', label='XGBoost Oracle', fill=True, alpha=0.3)
-    axes[0].set_title(f"Distribution Générative des PnL (%) - {pair_a}/{pair_b}")
-    axes[0].axvline(0, color='white', linestyle='--', linewidth=1)
-    axes[0].axvline(cvar_95_ret_pure, color='red', linestyle=':')
-    axes[0].axvline(cvar_95_ret_xgb, color='cyan', linestyle=':')
-    axes[0].legend()
-    
-    sns.kdeplot(df_pure['max_dd'], ax=axes[1], color='orange', label='Pure Stat Arb', fill=True, alpha=0.3)
-    sns.kdeplot(df_xgb['max_dd'], ax=axes[1], color='magenta', label='XGBoost Oracle', fill=True, alpha=0.3)
-    axes[1].set_title(f"Distribution Générative du Drawdown (%)")
-    axes[1].axvline(var_95_dd_pure, color='orange', linestyle=':')
-    axes[1].axvline(var_95_dd_xgb, color='magenta', linestyle=':')
-    axes[1].legend()
-
-    plot_path = os.path.join(project_root, "data", "storage", "synthetic_paths", f"{pair_a}x{pair_b}_cvar_plot.png")
+    for (name, m), color in zip(runs.items(), ("red", "cyan")):
+        s = summarize(m)
+        sns.kdeplot(m["total_return_pct"], ax=axes[0], color=color, label=name, fill=True, alpha=0.3, warn_singular=False)
+        axes[0].axvline(s["CVaR 95% PnL (%)"], color=color, linestyle=":")
+        sns.kdeplot(m["max_dd"], ax=axes[1], color=color, label=name, fill=True, alpha=0.3, warn_singular=False)
+        axes[1].axvline(s["Drawdown, 5e centile (%)"], color=color, linestyle=":")
+    axes[0].axvline(0, color="white", linestyle="--", linewidth=1)
+    axes[0].set_title(f"Distribution générative du PnL (%) - {title}")
+    axes[1].set_title("Distribution générative du drawdown (%)")
+    for ax in axes:
+        ax.legend()
     plt.tight_layout()
-    plt.savefig(plot_path, dpi=300)
-    logger.info(f"📸 Graphique de distribution sauvegardé : {plot_path}")
+    plt.savefig(path, dpi=300)
+    plt.close(fig)
+    logger.info(f"Graphique sauvegardé : {path}")
+
+
+def run_generative_cvar(pair_a: str, pair_b: str, n_paths: int = 200, horizon: int | None = None,
+                        anchor_offset: int = 0, seed: int = 0, oracle_path: str = ORACLE_PATH) -> pd.DataFrame | None:
+    engine, bt_cfg = make_chain()
+    bt = BacktestEngine(bt_cfg)
+    warm = evaluation_start(engine)
+
+    # 1. Historique réel et point d'ancrage
+    aligned = load_aligned(pair_a, pair_b)
+    anchor = len(aligned) - 1 - anchor_offset
+    if anchor_offset < 0 or anchor < warm:
+        raise ValueError(f"Ancrage impossible : {warm + 1} barres d'historique commun requises, "
+                         f"{max(anchor + 1, 0)} disponibles (anchor_offset={anchor_offset}).")
+    anchor_ts = int(aligned.index[anchor])
+    logger.info(f"{pair_a} x {pair_b} | ancrage {pd.Timestamp(anchor_ts, unit='ms'):%Y-%m-%d %H:%M} | {n_paths} trajectoires")
+
+    # 2. Oracle : entraîné sur CETTE chaîne et AVANT l'ancrage, sinon rien
+    try:
+        oracle = MetaOracle.load(oracle_path, engine, bt_cfg, as_of_ms=anchor_ts)
+    except (FileNotFoundError, OracleMismatch) as e:
+        logger.warning(f"XGB désactivé, HJB seul : {e}")
+        oracle = None
+
+    # 3. Prolongements synthétiques
+    sde = GenerativeSDEEngine(model_path=latest_checkpoint())
+    horizon = sde.model_seq_len - 1 if horizon is None else int(horizon)
+    markets = synthetic_markets(sde, f"{pair_a}x{pair_b}", aligned, anchor, horizon, n_paths, seed)
+
+    # 4. HJB, puis HJB + XGB, sur chaque prolongement
+    hist_a = aligned["a"].to_numpy()[anchor - warm:anchor + 1]       # l'ancrage est à l'indice `warm`
+    hist_b = aligned["b"].to_numpy()[anchor - warm:anchor + 1]
+    runs = {"HJB seul": []}
+    if oracle is not None:
+        runs["HJB + XGB"] = []
+    n_divergent = n_trades = n_kept = 0
+    for market in tqdm(markets, desc="Stress-test"):
+        syn_a, syn_b = market["SYNTH_A"].to_numpy(dtype=float), market["SYNTH_B"].to_numpy(dtype=float)
+        if diverged(syn_a) or diverged(syn_b):
+            n_divergent += 1                                          # rejetée et comptée, pas masquée
+            continue
+        pa = np.concatenate([hist_a, syn_a[1:]])                      # la barre 0 générée EST l'ancrage
+        pb = np.concatenate([hist_b, syn_b[1:]])
+        signal = engine.generate(np.arange(len(pa)), pa, pb)
+        ahead = signal.slice(warm, len(pa))
+        runs["HJB seul"].append(bt.run(ahead, lock_hedge=True)["metrics"])
+        if oracle is not None:
+            res = bt.run(ahead, lock_hedge=True, keep_trade=oracle.gate(np.log(pa), np.log(pb), signal, offset=warm))
+            runs["HJB + XGB"].append(res["metrics"])
+            n_trades += len(res["trades"])
+            n_kept += sum(t["kept"] for t in res["trades"])
+
+    # 5. Bilan
+    if n_divergent:
+        logger.warning(f"{n_divergent}/{len(markets)} trajectoires divergentes rejetées (le taux doit rester marginal).")
+    if not runs["HJB seul"]:
+        logger.error("Aucune trajectoire exploitable.")
+        return None
+    runs = {name: pd.DataFrame(rows) for name, rows in runs.items()}
+    table = pd.DataFrame({name: summarize(m) for name, m in runs.items()})
+    logger.info(f"{len(runs['HJB seul'])} prolongements de {horizon} barres\n" + table.to_string(float_format=lambda v: f"{v:.3f}"))
+    if oracle is not None:
+        logger.info(f"XGB (seuil {oracle.threshold:.2f}) : {n_kept}/{n_trades} trades gardés.")
+    plot_distributions(runs, f"{pair_a}/{pair_b}", os.path.join(PATHS_DIR, f"{pair_a}x{pair_b}_cvar_plot.png"))
+    return table
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--pair_a", type=str, default="ZEC_USDT")
     parser.add_argument("--pair_b", type=str, default="XRP_USDT")
     parser.add_argument("--n_paths", type=int, default=200)
+    parser.add_argument("--horizon", type=int, default=None, help="barres générées (défaut : longueur d'entraînement du générateur)")
+    parser.add_argument("--anchor_offset", type=int, default=0, help="ancrage à N barres de la fin de l'historique")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--oracle", type=str, default=ORACLE_PATH)
     args = parser.parse_args()
-    
-    run_generative_cvar(args.pair_a, args.pair_b, args.n_paths)
+
+    run_generative_cvar(args.pair_a, args.pair_b, args.n_paths, args.horizon, args.anchor_offset, args.seed, args.oracle)

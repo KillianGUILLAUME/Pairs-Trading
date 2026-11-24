@@ -1,138 +1,155 @@
+"""
+research/institutional/universal_oracle_trainer.py
+
+Entraîne l'oracle XGB (méta-label) sur les trades de la chaîne HJB actuelle, toutes paires confondues.
+Le trade, le label et les features sont définis dans `meta_labeling.py` (mêmes fonctions qu'à l'inférence).
+
+Protocole, fixé avant les résultats comme dans le reste du dépôt :
+  - trades CLOS avant `--cutoff` (2023-01-01) : apprentissage ; calibration et seuil choisis sur les prédictions
+    hors échantillon d'un walk-forward purgé ;
+  - trades OUVERTS à partir de `--cutoff` : évaluation, une seule fois, jamais utilisés pour choisir.
+Un trade à cheval sur la coupure n'est ni appris ni évalué.
+
+    python research/institutional/universal_oracle_trainer.py            # toutes les paires du dataset causal
+    python research/institutional/universal_oracle_trainer.py --limit 40 # essai (~16 trades par paire et par an : il en faut
+                                                                         # 300 hors échantillon, soit une vingtaine de paires)
+"""
+
 import os
+
+# À fixer AVANT tout import numérique : torch (libiomp5), scikit-learn et XGBoost (libomp) chargent chacun leur
+# runtime OpenMP dans le même processus (voir run_generative_cvar.py).
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+
+import argparse
+import pickle
 import sys
+from typing import List, Tuple
+
 import numpy as np
 import pandas as pd
-import pickle
 import xgboost as xgb
+from joblib import Parallel, delayed
 from loguru import logger
-import concurrent.futures
-from typing import Dict, List
 
-project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.append(project_root)
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
-from research.institutional.signal_engine import InstitutionalSignalEngine
-from research.institutional.feature_master import FeatureMaster
+from research.institutional.meta_labeling import (          # noqa: E402
+    ORACLE_PATH, SCHEMA, apply_platt, build_pair_dataset, chain_fingerprint, feature_columns, feature_matrix,
+    logit, make_chain, purged_walk_forward, select_threshold,
+)
 
-def build_single_pair_dataset(pair_a: str, pair_b: str, window: int = 156):
+MIN_FOLD_TRADES = 100      # en dessous, un pli n'apprend rien d'utile
+MIN_OOF_TRADES = 300       # en dessous, calibration et seuil ne sont que du bruit
+
+
+def make_model() -> xgb.XGBClassifier:
     """
-    Extrait les features et labels pour une seule paire.
+    Modèle volontairement petit : l'événement est un trade (quelques milliers au total), plus une barre (des dizaines
+    de milliers d'exemples quasi dupliqués). Pas de `scale_pos_weight`, qui décalibre les probabilités.
     """
-    try:
-        data_dir = os.path.join(project_root, "data", "storage", "parquet", "1h")
-        df_a = pd.read_parquet(os.path.join(data_dir, f"{pair_a}.parquet"))
-        df_b = pd.read_parquet(os.path.join(data_dir, f"{pair_b}.parquet"))
-        
-        df = pd.merge(df_a[['timestamp', 'close']], df_b[['timestamp', 'close']], on='timestamp', suffixes=('_a', '_b'))
-        df = df.sort_values('timestamp').reset_index(drop=True)
-        
-        ts = df['timestamp'].values
-        pa = df['close_a'].values.astype(float)
-        pb = df['close_b'].values.astype(float)
-        
-        # Signaux Primaires (HJB)
-        engine = InstitutionalSignalEngine(window=window, solver_type="fpt", cost=0.001)
-        sig = engine.generate(ts, pa, pb)
-        
-        # Triple Barrier Labeling
-        target_pct = 0.02
-        stop_pct = 0.015
-        timeout = 168 # 1 semaine
-        
-        log_a = np.log(pa)
-        log_b = np.log(pb)
-        spreads = sig.spreads
-        entries = np.where((sig.entry_long == 1) | (sig.entry_short == 1))[0]
-        
-        X = []
-        y = []
-        fm = FeatureMaster(signature_level=2)
-        
-        for idx in entries:
-            if idx + timeout >= len(spreads): continue
-            h_start = max(0, idx - 127)
-            if idx - h_start < 64: continue
-            
-            f_dict = fm.get_feature_vector(log_a[h_start:idx+1], log_b[h_start:idx+1])
-            f_dict["spread_at_entry"] = spreads[idx]
-            f_dict["dist_to_mu"] = np.abs(spreads[idx] - np.mean(spreads[h_start:idx+1]))
-            
-            # Labeling
-            side = 1 if sig.entry_long[idx] == 1 else -1
-            p_entry = spreads[idx]
-            label = 0
-            for t in range(1, timeout):
-                p_now = spreads[idx + t]
-                ret = (p_now - p_entry) if side == 1 else (p_entry - p_now)
-                if ret >= target_pct:
-                    label = 1
-                    break
-                if ret <= -stop_pct:
-                    label = 0
-                    break
-            
-            X.append(list(f_dict.values()))
-            y.append(label)
-            
-        return np.array(X), np.array(y), list(f_dict.keys()) if X else None
-    except Exception as e:
-        logger.error(f"❌ Erreur sur {pair_a}x{pair_b} : {e}")
-        return None, None, None
+    return xgb.XGBClassifier(n_estimators=200, max_depth=3, learning_rate=0.03, min_child_weight=5, subsample=0.8,
+                             colsample_bytree=0.8, eval_metric="logloss", tree_method="hist", random_state=0, n_jobs=1)
 
-def train_universal_oracle():
-    # 1. Sélection des paires
-    data_dir = os.path.join(project_root, "data", "storage", "parquet", "1h")
-    available_files = [f.replace(".parquet", "") for f in os.listdir(data_dir) if f.endswith(".parquet")]
-    
-    screened_path = os.path.join(project_root, "data", "storage", "screened/super_dataset_SDE_128.parquet")
-    df_s = pd.read_parquet(screened_path)
-    all_pairs = df_s[['pair_a', 'pair_b']].drop_duplicates().values.tolist()
-    pairs = [(p[0], p[1]) for p in all_pairs if p[0] in available_files and p[1] in available_files]
-    
-    logger.info(f"🔨 CONSTRUCTION DU DATASET UNIVERSEL | {len(pairs)} PAIRES")
-    
-    X_agg = []
-    y_agg = []
-    feature_names = None
-    
-    # 2. Pipeline Parallèle
-    with concurrent.futures.ProcessPoolExecutor(max_workers=8) as executor:
-        futures = {executor.submit(build_single_pair_dataset, p[0], p[1]): p for p in pairs}
-        for future in concurrent.futures.as_completed(futures):
-            X, y, f_names = future.result()
-            if X is not None and len(X) > 0:
-                X_agg.append(X)
-                y_agg.append(y)
-                if feature_names is None: feature_names = f_names
-                logger.info(f"✅ Paire traitée : {futures[future]} | Samples: {len(X)}")
 
-    X_final = np.concatenate(X_agg)
-    y_final = np.concatenate(y_agg)
-    
-    logger.info(f"📊 Training Matrix: {X_final.shape} | Positive Class: {np.mean(y_final)*100:.1f}%")
-    
-    # 3. Training
-    model = xgb.XGBClassifier(
-        n_estimators=1000, # Augmenté pour capturer la richesse des 20+ features
-        max_depth=8,       # Profondeur accrue pour les interactions stats/signatures
-        learning_rate=0.02,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        eval_metric="logloss",
-        tree_method="hist"  # Faster for large datasets
-    )
-    
-    model.fit(X_final, y_final)
-    
-    # 4. Save
-    out_dir = os.path.join(project_root, "data", "models", "institutional")
-    os.makedirs(out_dir, exist_ok=True)
-    save_path = os.path.join(out_dir, "oracle_v3_universal.pkl")
-    
-    with open(save_path, "wb") as f:
-        pickle.dump({"model": model, "features": feature_names}, f)
-        
-    logger.info(f"🚀 Oracle V3 UNIVERSEL (Fused Features) sauvegardé dans {save_path}")
+def fit_platt(raw: np.ndarray, y: np.ndarray) -> Tuple[float, float]:
+    from sklearn.linear_model import LogisticRegression
+    lr = LogisticRegression(C=1e6).fit(logit(raw).reshape(-1, 1), y)
+    return float(lr.coef_[0, 0]), float(lr.intercept_[0])
+
+
+def out_of_fold(train: pd.DataFrame, names: List[str]) -> np.ndarray:
+    """Scores bruts hors échantillon (NaN pour le premier bloc et les plis trop petits)."""
+    X, y = feature_matrix(train, names), train["label"].to_numpy()
+    oof = np.full(len(train), np.nan)
+    for tr, va in purged_walk_forward(train["t_entry"].to_numpy(), train["t_exit"].to_numpy()):
+        if len(tr) < MIN_FOLD_TRADES or len(np.unique(y[tr])) < 2:
+            continue
+        oof[va] = make_model().fit(X[tr], y[tr]).predict_proba(X[va])[:, 1]
+    return oof
+
+
+def report(label: str, trades: pd.DataFrame, p: np.ndarray, threshold: float) -> dict:
+    """Bilan net de coûts : tous les trades HJB contre ceux que l'oracle garde."""
+    net = trades["net_ret"].to_numpy()
+    kept = p >= threshold
+    out = {"n": int(len(net)), "n_kept": int(kept.sum()), "threshold": float(threshold),
+           "win_rate": float((net > 0).mean()) if len(net) else float("nan"),
+           "net_bp": float(net.mean() * 1e4) if len(net) else float("nan"),
+           "win_rate_kept": float((net[kept] > 0).mean()) if kept.any() else float("nan"),
+           "net_bp_kept": float(net[kept].mean() * 1e4) if kept.any() else float("nan")}
+    logger.info(f"{label} : {out['n']} trades, gagnants {out['win_rate']:.1%}, net moyen {out['net_bp']:.0f} pb | "
+                f"gardés {out['n_kept']}, gagnants {out['win_rate_kept']:.1%}, net moyen {out['net_bp_kept']:.0f} pb")
+    return out
+
+
+def train_universal_oracle(pairs: List[Tuple[str, str]], cutoff: str = "2023-01-01", out_path: str = ORACLE_PATH,
+                           jobs: int = 6) -> dict:
+    # 1. Un exemple par trade clos de la chaîne HJB
+    frames = Parallel(n_jobs=jobs, verbose=1)(delayed(build_pair_dataset)(a, b) for a, b in pairs)
+    frames = [f for f in frames if f is not None]
+    if not frames:
+        raise RuntimeError("Aucun trade : vérifier les parquets et la longueur d'historique.")
+    data = pd.concat(frames, ignore_index=True).sort_values("t_entry", kind="stable").reset_index(drop=True)
+    names = feature_columns(data)
+
+    # 2. Coupure chronologique
+    cutoff_ms = int(pd.Timestamp(cutoff, tz="UTC").timestamp() * 1000)
+    train = data[data["t_exit"] < cutoff_ms].reset_index(drop=True)
+    test = data[data["t_entry"] >= cutoff_ms].reset_index(drop=True)
+    logger.info(f"{len(data)} trades sur {data['pair'].nunique()} paires | apprentissage {len(train)} (clos avant {cutoff}) | "
+                f"évaluation {len(test)} | à cheval, écartés {len(data) - len(train) - len(test)}")
+
+    # 3. Calibration et seuil sur prédictions hors échantillon
+    oof = out_of_fold(train, names)
+    seen = np.isfinite(oof)
+    y, net = train["label"].to_numpy(), train["net_ret"].to_numpy()
+    if seen.sum() < MIN_OOF_TRADES or len(np.unique(y[seen])) < 2:
+        raise RuntimeError(f"{int(seen.sum())} prédictions hors échantillon exploitables ({MIN_OOF_TRADES} requises) : "
+                           "trop peu de trades pour entraîner un méta-label.")
+    platt = fit_platt(oof[seen], y[seen])
+    p_oof = apply_platt(oof[seen], platt)
+    if platt[0] > 0:
+        threshold = select_threshold(p_oof, net[seen])
+    else:
+        threshold = float("inf")
+        logger.warning(f"Pente de calibration {platt[0]:.2f} <= 0 : le score n'ordonne pas les trades, l'oracle rejette tout.")
+    if not np.isfinite(threshold):
+        logger.warning("Aucun seuil ne donne un rendement net positif hors échantillon : l'oracle rejette tous les trades.")
+
+    # 4. Modèle final, puis évaluation unique
+    model = make_model().fit(feature_matrix(train, names), y)
+    reports = {"oof": report("Hors échantillon (apprentissage)", train[seen], p_oof, threshold)}
+    if len(test):
+        p_test = apply_platt(model.predict_proba(feature_matrix(test, names))[:, 1], platt)
+        reports["test"] = report(f"Évaluation (à partir de {cutoff})", test, p_test, threshold)
+
+    # 5. Sauvegarde : le modèle, et tout ce qui permet de refuser un mauvais usage
+    engine, cfg = make_chain()
+    payload = {"schema": SCHEMA, "model": model, "features": names, "platt": platt, "threshold": threshold,
+               "chain": chain_fingerprint(engine, cfg), "train_end_ms": cutoff_ms, "reports": reports}
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "wb") as f:
+        pickle.dump(payload, f)
+    logger.info(f"Oracle sauvegardé dans {out_path}")
+    return payload
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--cutoff", default="2023-01-01", help="date UTC séparant apprentissage et évaluation")
+    ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--jobs", type=int, default=6)
+    ap.add_argument("--out", default=ORACLE_PATH)
+    ap.add_argument("--dataset", default=os.path.join(PROJECT_ROOT, "data", "storage", "screened", "super_dataset_SDE_128_causal.parquet"))
+    args = ap.parse_args()
+    pairs = pd.read_parquet(args.dataset, columns=["pair_a", "pair_b"]).drop_duplicates().values.tolist()
+    if args.limit:
+        pairs = pairs[:args.limit]
+    train_universal_oracle([tuple(p) for p in pairs], cutoff=args.cutoff, out_path=args.out, jobs=args.jobs)
+
 
 if __name__ == "__main__":
-    train_universal_oracle()
+    main()

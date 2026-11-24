@@ -22,11 +22,14 @@ from typing import Tuple
 import numpy as np
 
 
-def locked_positions(sig, log_a: np.ndarray, log_b: np.ndarray, max_hold: int,
+def locked_positions(sig, log_a: np.ndarray, log_b: np.ndarray, max_hold: int | np.ndarray,
                      stop_sd: float | None = None, return_trades: bool = False):
     """
     Retourne (positions, betas_verrouillés[, trades]). Les betas verrouillés valent beta_e pendant un trade
     et le beta courant à plat ; ils sont à passer au moteur de gain (qui les décale d'une barre).
+
+    max_hold : durée maximale en barres. Scalaire, ou tableau par barre : on lit alors la valeur à la barre
+               d'ENTRÉE et elle est figée pour tout le trade.
 
     stop_sd : stop adverse en écarts-types stationnaires sigma_inf = sigma/sqrt(2 theta) (calibration de l'entrée)
               AU-DELÀ du niveau d'entrée, mesuré sur le spread verrouillé. None : pas de stop.
@@ -38,6 +41,7 @@ def locked_positions(sig, log_a: np.ndarray, log_b: np.ndarray, max_hold: int,
     betas = np.array(sig.betas, dtype=float)
     alphas = sig.alphas if sig.alphas is not None else np.zeros(n)
     flip_ok = bool(getattr(sig, "allow_flip", False))
+    hold_cap = np.broadcast_to(np.asarray(max_hold, dtype=float), (n,))
 
     sinf = None
     if sig.theta_hat is not None:                  # nécessaire aussi sans stop : l'excursion adverse est toujours mesurée
@@ -49,6 +53,7 @@ def locked_positions(sig, log_a: np.ndarray, log_b: np.ndarray, max_hold: int,
     entry_bar = 0
     b_e = a_e = exit_lvl = flip_lvl = 0.0
     entry_lvl = stop_lvl = sinf_e = np.nan
+    hold_e = np.inf      # durée maximale du trade en cours, figée à l'entrée
     adverse = 0.0
     blocked = 0          # côté bloqué après un stop (+1 : long, -1 : short)
 
@@ -56,8 +61,9 @@ def locked_positions(sig, log_a: np.ndarray, log_b: np.ndarray, max_hold: int,
         trades.append({"entry": entry_bar, "exit": i, "side": side, "kind": kind, "mae_sd": adverse})
 
     def open_position(i, s):
-        nonlocal side, entry_bar, b_e, a_e, exit_lvl, flip_lvl, entry_lvl, stop_lvl, sinf_e, adverse
+        nonlocal side, entry_bar, b_e, a_e, exit_lvl, flip_lvl, entry_lvl, stop_lvl, sinf_e, adverse, hold_e
         side, entry_bar = s, i
+        hold_e = hold_cap[i]
         adverse = 0.0
         b_e, a_e = float(sig.betas[i]), float(alphas[i])
         if s == 1:
@@ -95,7 +101,7 @@ def locked_positions(sig, log_a: np.ndarray, log_b: np.ndarray, max_hold: int,
             else:
                 hit_exit = np.isfinite(exit_lvl) and x <= exit_lvl
                 opposite = sig.entry_long[i] > 0
-            timed_out = (i - entry_bar) >= max_hold
+            timed_out = (i - entry_bar) >= hold_e
             if hit_exit or timed_out:
                 if flip_ok and hit_exit and opposite:
                     close_trade(i, "retournement")
